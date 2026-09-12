@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>企业 Agent 中台技术方案</title><style>body{margin:0;background:#f2f5f9;color:#243247;font:16px/1.85 system-ui,-apple-system,"Microsoft YaHei",sans-serif}main{max-width:1060px;margin:32px auto;padding:36px 44px;background:white;border-top:5px solid #245ba5}h1{font-size:32px}h2{margin-top:34px;border-bottom:1px solid #dce4ee;padding-bottom:8px}a{color:#245ba5}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:10px 12px;border:1px solid #dce4ee;text-align:left;vertical-align:top}th{background:#edf3fb}code{background:#eef2f7;padding:2px 5px;border-radius:4px}pre{white-space:pre-wrap;overflow:auto;padding:16px;background:#eef2f7}@media(max-width:700px){main{margin:0;padding:22px 18px}table{min-width:650px}}</style></head><body><main><h1>企业 Agent 中台技术方案</h1><p>DSH 作为平台主基座；自研 Multica Runtime 插件；复用 Multica Server/Daemon 调度不同 CLI；沙箱作为独立运行环境。</p><p>完整可编辑版本请查看 <a href="architecture.md">architecture.md</a>。</p><h2>七层架构</h2><table><thead><tr><th>层次</th><th>职责</th><th>技术选型</th></tr></thead><tbody><tr><td>用户入口</td><td>聊天、文件、Runtime 与环境选择</td><td>自定义 Web、飞书 Bot</td></tr><tr><td>统一网关</td><td>登录、用户映射、消息路由与流式回复</td><td>现有 Gateway、Keycloak</td></tr><tr><td>DSH 基座</td><td>插件、Skills、MCP、Memory、Session</td><td>DSH Profile 与插件体系</td></tr><tr><td>Runtime 适配</td><td>将 DSH Agent 请求转成 Multica 任务</td><td>自研 DSH–Multica 插件</td></tr><tr><td>执行调度</td><td>机器注册、任务排队、CLI 调用、结果上报</td><td>Multica Server / Daemon</td></tr><tr><td>运行环境</td><td>个人、项目、临时、持久或本地环境</td><td>CubeSandbox、现有 VM、本地环境</td></tr><tr><td>数据与评测</td><td>会话、文件、Trajectory 和质量评测</td><td>PostgreSQL、S3、Langfuse</td></tr></tbody></table><h2>执行链</h2><pre>自定义 Web / 飞书 Bot
+        ↓
+统一 Gateway
+        ↓
+DSH 平台基座（Session、Skills/MCP、用户插件、Memory/Trajectory）
+        ↓
+自研 Multica Runtime 插件
+        ↓
+Multica Server → 目标 Daemon → DSH / Codex / Claude Code / Pi
+        ↓
+个人/项目云端沙箱 或 用户本地电脑</pre><h2>关键原则</h2><ul><li>Runtime 决定谁执行；运行环境决定在哪里执行。</li><li>同一会话可切 Runtime，DSH Session 作为平台主记录。</li><li>企业 Skill/MCP 由 DSH 管理，通过 Runtime 插件同步到 Multica。</li><li>云端优先 CubeSandbox；本地通过 Multica Daemon 连接用户机器。</li></ul></main></body></html>
