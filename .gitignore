@@ -1,0 +1,7 @@
+node_modules/
+.runtime/
+*.log
+.env
+*.token
+*.cookie
+dist/client.js

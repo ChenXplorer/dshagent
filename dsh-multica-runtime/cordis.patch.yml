@@ -1,0 +1,10 @@
+# Replace the default agent loop. A patch cannot rename a row, so disable
+# `@deepseek-ai/dsh-agent-loop` then insert this factory.
+- id: agent-loop
+  disabled: true
+- insert:
+    - id: multica-runtime
+      name: dsh-multica-runtime
+      config:
+        runtime: codex
+        machineId: cube-personal

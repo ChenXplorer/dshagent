@@ -1,18 +1,38 @@
-# DSH Agent Platform
+# DSH Agent
 
-企业 Agent 中台概念设计，面向约 200 名员工。
+DSH 基座 + Multica Runtime 插件：用官方 Multica Server/Daemon 调度 Codex / Claude CLI，替换默认 `dsh-agent-loop`。
 
-**DSH 是平台主基座；自研 Multica Runtime 插件；复用 Multica Server/Daemon 调度 DSH、Codex、Claude Code、Pi 等 CLI；沙箱作为独立运行环境。**
+- 技术方案：[docs/architecture.md](docs/architecture.md)
+- 插件入口：`dsh-multica-runtime/`（Cordis `setFactory`）
+- 官方控制面客户端：`src/multica/official.ts`
+- 原生 DSH Agent：`src/plugin/dsh-native.ts`
 
-- [完整技术方案（Markdown）](docs/architecture.md)
-- [HTML 阅读版](docs/architecture.html)
+## 安装
+
+```bash
+# 官方 DSH web profile
+dsh plugin --profile web add "$(pwd)/dsh-multica-runtime"
+```
+
+`cordis.patch.yml` 会禁用 `agent-loop` 并插入 `multica-runtime`。
+
+需要的环境变量：
+
+| 变量 | 说明 |
+| --- | --- |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key，供 Codex/Claude CLI 使用 |
+| `MULTICA_OFFICIAL_URL` | 官方 Multica Server，例如 `http://127.0.0.1:18080` |
+| `MULTICA_TOKEN` | Multica PAT |
+| `MULTICA_WORKSPACE_ID` | Multica workspace id |
+
+## 运行
+
+1. 启动官方 Multica Server + Daemon（Postgres + CLI runtime）。
+2. 配置上述环境变量。
+3. `dsh web` 加载 web profile；插件接管 turn，把用户消息交给 Multica task。
 
 ## 状态
 
-本文档是目标架构。核心接口已核实；Multica Runtime 插件和整体联调仍需实现。
+已实现：官方 Multica 控制面、DSH native factory、`user/message` / `assistant/message` 的 `surfaceOp`、会话走通。
 
-## 架构主线
-
-`用户入口 → Gateway → DSH 基座 → Multica Runtime 插件 → Multica Server/Daemon → 目标 Runtime / 云端或本地环境`
-
-方案基于 [DSH](https://github.com/deepseek-ai/deepseek-harness) 和 [Multica](https://github.com/multica-ai/multica)。
+仍需：把 Multica Server 绑到本机回环，避免和 DSH web 抢预览入口。
