@@ -1,9 +1,5 @@
-import { readFileSync } from "node:fs";
-import { emitAgentEvent } from "@deepseek-ai/dsh-agent";
-import { createAssistantMessage } from "@deepseek-ai/dsh-llm";
-import { createScope } from "@deepseek-ai/dsh-scope";
-
 // src/multica/official.ts
+import { readFileSync } from "node:fs";
 
 // src/plugin/capabilities.ts
 var NATIVE_DSH_PROFILE = "dsh-native";
@@ -503,6 +499,9 @@ function sleep(ms) {
 }
 
 // src/plugin/dsh-native.ts
+import { emitAgentEvent } from "@deepseek-ai/dsh-agent";
+import { createAssistantMessage } from "@deepseek-ai/dsh-llm";
+import { createScope } from "@deepseek-ai/dsh-scope";
 
 // src/plugin/mapping.ts
 var BindingStore = class {
@@ -657,20 +656,108 @@ var DshNativeFactory = class {
   config;
   async createAgent(ownerCtx, options) {
     ownerCtx.fiber?.assertActive?.();
+    const live = this.reuseLive(options.sessionId);
+    if (live) return live;
+    const attached = this.attachedSession(ownerCtx, options.sessionId);
+    if (attached) {
+      return this.publish(ownerCtx, options.sessionId, attached, options, void 0, "startup");
+    }
     const cwd = options.meta?.cwd && options.meta.cwd.startsWith("/") ? options.meta.cwd : process.cwd();
     const session = this.pluginCtx.sessions.prepare(options.sessionId, {
       ...options.seed === void 0 ? {} : { seed: options.seed },
       ...options.inheritedEventCount === void 0 ? {} : { inheritedEventCount: options.inheritedEventCount },
       meta: { cwd, ...options.meta }
     });
-    const persistence = this.pluginCtx.get?.("sessionPersistence");
-    const stored = persistence?.create ? await persistence.create(session.header, {
-      inheritedEventCount: session.inheritedEventCount,
-      ...options.signal === void 0 ? {} : { signal: options.signal }
-    }) : void 0;
+    const persistence = this.persistence(ownerCtx);
+    let stored;
+    try {
+      stored = persistence?.create ? await persistence.create(session.header, {
+        inheritedEventCount: session.inheritedEventCount,
+        ...options.signal === void 0 ? {} : { signal: options.signal }
+      }) : void 0;
+    } catch (error) {
+      if (isAlreadyExists(error)) {
+        return this.resume(ownerCtx, {
+          resumeSessionId: options.sessionId,
+          agentOptions: options.agentOptions,
+          parentAgent: options.parentAgent,
+          setup: options.setup,
+          signal: options.signal
+        });
+      }
+      throw error;
+    }
+    try {
+      return await this.publish(ownerCtx, options.sessionId, session, options, stored, "startup", 0);
+    } catch (error) {
+      await stored?.close?.().catch(() => {
+      });
+      throw error;
+    }
+  }
+  async resume(ownerCtx, options) {
+    ownerCtx.fiber?.assertActive?.();
+    const id = options.resumeSessionId;
+    const live = this.reuseLive(id);
+    if (live) return live;
+    const attached = this.attachedSession(ownerCtx, id);
+    if (attached) {
+      const persistence2 = this.persistence(ownerCtx);
+      let stored;
+      try {
+        stored = persistence2?.open ? await persistence2.open(id, "write", options.signal === void 0 ? void 0 : { signal: options.signal }) : void 0;
+      } catch {
+        stored = void 0;
+      }
+      return this.publish(ownerCtx, id, attached, options, stored, "resume");
+    }
+    const persistence = this.persistence(ownerCtx);
+    if (!persistence?.open) {
+      throw new Error("cannot resume: session persistence is not configured (load a dsh-session-persistence backend)");
+    }
+    const handle = await persistence.open(id, "write", options.signal === void 0 ? void 0 : { signal: options.signal });
+    try {
+      const coldRead = await handle.read?.(
+        0,
+        Number.MAX_SAFE_INTEGER,
+        options.signal === void 0 ? void 0 : { signal: options.signal }
+      );
+      const persisted = Array.isArray(coldRead?.events) ? coldRead.events : [];
+      const closers = interruptedClosers(persisted);
+      if (closers.length > 0 && handle.append) await handle.append(closers);
+      const eventState = coldRead?.eventState;
+      const session = this.pluginCtx.sessions.prepare(id, {
+        seed: [...persisted, ...closers],
+        meta: handle.header ? structuredClone(handle.header) : void 0,
+        inheritedEventCount: handle.inheritedEventCount,
+        ...eventState === "detached" || eventState === "shared-frozen" ? { eventState } : {}
+      });
+      return await this.publish(ownerCtx, id, session, options, handle, "resume", persisted.length + closers.length);
+    } catch (error) {
+      await handle.close?.().catch(() => {
+      });
+      throw error;
+    }
+  }
+  persistence(_ownerCtx) {
+    const value = this.pluginCtx.get?.("sessionPersistence");
+    if (!value || typeof value !== "object") return void 0;
+    return value;
+  }
+  reuseLive(id) {
+    const agent = this.pluginCtx.agents.get?.(id);
+    if (!agent || typeof agent !== "object") return void 0;
+    if (!("followup" in agent)) return void 0;
+    return { agent, dispose: async () => {
+    } };
+  }
+  attachedSession(_ownerCtx, id) {
+    return this.pluginCtx.sessions.get?.(id);
+  }
+  async publish(ownerCtx, id, session, options, stored, source, storedCount = 0) {
     const agent = new DshNativeAgent(
       this.pluginCtx,
-      options.sessionId,
+      id,
       options.agentOptions ?? {},
       session,
       this.client,
@@ -681,6 +768,7 @@ var DshNativeFactory = class {
         const commit = await options.setup(agent.ctx, agent);
         commit?.commit?.();
       }
+      await flushUnstored(stored, session, storedCount);
     } catch (error) {
       await stored?.close?.().catch(() => {
       });
@@ -690,30 +778,39 @@ var DshNativeFactory = class {
     }
     let detachSession;
     let detachAgent;
+    let unfollowOwner;
+    let disposing;
     const dispose = async () => {
-      agent.cancel({ kind: "disposed" });
-      await agent.whenIdle();
-      detachAgent?.();
-      detachSession?.();
-      await stored?.close?.().catch(() => {
-      });
-      await agent.scope.dispose();
+      disposing ??= (async () => {
+        agent.cancel({ kind: "disposed" });
+        await agent.whenIdle();
+        detachAgent?.();
+        detachSession?.();
+        await stored?.close?.().catch(() => {
+        });
+        await agent.scope.dispose();
+        try {
+          unfollowOwner?.();
+        } catch {
+        }
+      })();
+      return disposing;
     };
-    detachSession = agent.ctx.sessions.enter(session);
-    detachAgent = this.pluginCtx.agents.enter(agent, options.parentAgent);
-    agent.ctx.sessions.announce(session);
-    this.pluginCtx.agents.announce(agent);
-    emitAgentEvent(agent.ctx, agent, "agent/session-start", { source: "startup" });
-    return { agent, dispose };
-  }
-  async resume(ownerCtx, options) {
-    return this.createAgent(ownerCtx, {
-      sessionId: options.resumeSessionId,
-      agentOptions: options.agentOptions,
-      parentAgent: options.parentAgent,
-      setup: options.setup,
-      signal: options.signal
-    });
+    try {
+      unfollowOwner = ownerCtx.effect(() => () => {
+        void dispose();
+      }, `dsh-multica-runtime.lifecycle(${id})`) ?? void 0;
+      detachSession = agent.ctx.sessions.enter(session);
+      detachAgent = this.pluginCtx.agents.enter(agent, options.parentAgent);
+      agent.ctx.sessions.announce(session);
+      this.pluginCtx.agents.announce(agent);
+      emitAgentEvent(agent.ctx, agent, "agent/session-start", { source });
+      return { agent, dispose };
+    } catch (error) {
+      await dispose().catch(() => {
+      });
+      throw error;
+    }
   }
 };
 var DshNativeAgent = class {
@@ -741,6 +838,7 @@ var DshNativeAgent = class {
     this.client = client;
     this.config = config;
     this.catalog = config.catalog ?? { skills: [], mcp: [] };
+    this.turn = lastTurnNumber(sessionEvents(session));
     this.scope = createScope(ownerCtx, this);
     this.ctx = this.scope.ctx;
     this.inbox = new NativeInbox((message, kind, turn) => {
@@ -775,6 +873,9 @@ var DshNativeAgent = class {
   }
   cancel(cause, options) {
     this.cancelCause = cause;
+    if (cause && typeof cause === "object" && "kind" in cause && cause.kind === "disposed") {
+      this.disposed = true;
+    }
     if (!options?.keepInbox) this.inbox.clear();
     const segment = this.bindings.currentOrNull(this.id);
     if (segment?.currentTaskId) {
@@ -877,18 +978,22 @@ var DshNativeAgent = class {
         try {
           if (event.type === "text/committed") {
             const text = String(event.data["text"] ?? "");
-            this.session.append("assistant/message", {
-              turn,
-              step: 1,
-              message: createAssistantMessage({
-                content: [{ type: "text", text }],
-                source: {
-                  provider: this.options.provider ?? "deepseek-official",
-                  model: this.options.model ?? "deepseek-flash"
-                }
-              }),
-              stream: []
-            }, { surfaceOp: "append" });
+            this.session.append(
+              "assistant/message",
+              {
+                turn,
+                step: 1,
+                message: createAssistantMessage({
+                  content: [{ type: "text", text }],
+                  source: {
+                    provider: this.options.provider ?? "deepseek-official",
+                    model: this.options.model ?? "deepseek-flash"
+                  }
+                }),
+                stream: []
+              },
+              { surfaceOp: "append" }
+            );
           }
           if (event.type === "task/completed") {
             this.session.append("step/end", { turn, step: 1 });
@@ -967,6 +1072,77 @@ var NativeInbox = class {
     return claimed;
   }
 };
+function sessionEvents(session) {
+  if (typeof session.snapshotEvents === "function") {
+    try {
+      const snap = session.snapshotEvents();
+      return Array.isArray(snap) ? [...snap] : [];
+    } catch {
+      return [];
+    }
+  }
+  return Array.isArray(session.events) ? [...session.events] : [];
+}
+function lastTurnNumber(events) {
+  let turn = 0;
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue;
+    const rec = event;
+    if (rec.type !== "turn/start" && rec.type !== "turn/end") continue;
+    const n = rec.data?.turn;
+    if (typeof n === "number" && Number.isFinite(n) && n > turn) turn = n;
+  }
+  return turn;
+}
+function interruptedClosers(events) {
+  let openTurn = null;
+  let openStep = null;
+  let last = null;
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue;
+    const rec = event;
+    if (typeof rec.seq === "number") {
+      last = { seq: rec.seq, time: typeof rec.time === "number" ? rec.time : 0 };
+    }
+    if (rec.type === "turn/start") {
+      openTurn = typeof rec.data?.turn === "number" ? rec.data.turn : openTurn;
+      openStep = null;
+    } else if (rec.type === "turn/end") {
+      openTurn = null;
+      openStep = null;
+    } else if (rec.type === "step/start") {
+      openStep = typeof rec.data?.step === "number" ? rec.data.step : openStep;
+    } else if (rec.type === "step/end") {
+      openStep = null;
+    }
+  }
+  if (openTurn === null || last === null) return [];
+  const closers = [];
+  let seq = last.seq + 1;
+  if (openStep !== null) {
+    closers.push({ type: "step/end", seq, time: last.time, data: { turn: openTurn, step: openStep } });
+    seq += 1;
+  }
+  closers.push({
+    type: "turn/end",
+    seq,
+    time: last.time,
+    data: { turn: openTurn, reason: { kind: "interrupted" } }
+  });
+  return closers;
+}
+function isAlreadyExists(error) {
+  if (!error || typeof error !== "object") return false;
+  const name2 = "name" in error ? String(error.name) : "";
+  const message = "message" in error ? String(error.message) : String(error);
+  return name2 === "SessionAlreadyExistsError" || /already exists/i.test(message);
+}
+async function flushUnstored(stored, session, storedCount) {
+  if (!stored?.append) return;
+  const events = sessionEvents(session);
+  if (events.length <= storedCount) return;
+  await stored.append([...events.slice(storedCount)]);
+}
 function applyNative(ctx, client, config = {}) {
   const factory = new DshNativeFactory(ctx, client, config);
   ctx.effect(() => ctx.agents.setFactory(factory), "dsh-multica-runtime.setFactory()");
@@ -978,7 +1154,7 @@ function applyNative(ctx, client, config = {}) {
         if (html.includes("__DSH_TRANSPORT__")) return html;
         return html.replace(
           /<head([^>]*)>/i,
-          `<head$1><script>globalThis.__DSH_TRANSPORT__=Object.assign(globalThis.__DSH_TRANSPORT__||{},{ownsHost:true});<\/script>`
+          `<head$1><script>globalThis.__DSH_TRANSPORT__=Object.assign(globalThis.__DSH_TRANSPORT__||{},{ownsHost:true});</script>`
         );
       }),
       "dsh-multica-runtime.ownsHost"

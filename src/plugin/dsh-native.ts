@@ -20,42 +20,65 @@ import type {
   UserMessage as PluginUserMessage,
 } from "./types.ts";
 
+type PersistenceHandle = {
+  close?: () => Promise<void>;
+  header?: { cwd?: string; createdAt?: number; [key: string]: unknown };
+  inheritedEventCount?: number;
+  read?: (
+    start: number,
+    end?: number,
+    options?: { signal?: AbortSignal },
+  ) => Promise<{ events: unknown; eventState?: string }>;
+  append?: (events: unknown[]) => Promise<void>;
+};
+
+type SessionPersistence = {
+  create?: (
+    header: unknown,
+    options?: { inheritedEventCount?: number; signal?: AbortSignal },
+  ) => Promise<PersistenceHandle>;
+  open?: (
+    id: string,
+    access: "read" | "write",
+    options?: { signal?: AbortSignal },
+  ) => Promise<PersistenceHandle>;
+};
+
 type AnyCtx = {
   sessions: {
     prepare: (
       id: string,
       options?: {
         seed?: unknown;
-        meta?: { cwd?: string; agentPreset?: string };
+        meta?: unknown;
         inheritedEventCount?: number;
+        eventState?: string;
       },
     ) => OfficialSession;
     enter: (session: OfficialSession) => () => void;
     announce: (session: OfficialSession) => void;
+    get?: (id: string) => OfficialSession | undefined;
   };
   agents: {
     enter: (agent: unknown, owner?: unknown) => () => void;
     announce: (agent: unknown) => void;
     setFactory: (factory: unknown) => () => void;
+    get?: (id: string) => unknown;
   };
-  effect: (fn: () => (() => void) | void, label?: string) => () => void;
+  effect: (fn: () => (() => void) | void, label?: string) => (() => void) | void;
   fiber?: { assertActive?: () => void };
   inject?: (deps: string[], callback: (scoped: AnyCtx) => void) => () => void;
-  get?: (name: string) =>
-    | {
-        create?: (
-          header: unknown,
-          options?: { inheritedEventCount?: number; signal?: AbortSignal },
-        ) => Promise<{ close?: () => Promise<void> }>;
-        tapIndex?: (transform: (html: string) => string) => () => void;
-      }
-    | undefined;
+  get?: (name: string) => SessionPersistence | { tapIndex?: (transform: (html: string) => string) => () => void } | undefined;
+  plugin?: (plugin: unknown) => { ctx: AnyCtx; dispose: () => void | Promise<void> };
+  events?: { dispatch: (type: string, args: unknown[]) => Array<(...args: unknown[]) => unknown> };
+  logger?: { warn: (message: string) => void };
 };
 
 interface OfficialSession {
   id: string;
-  header: { cwd?: string };
-  events: readonly unknown[];
+  header: { cwd?: string; createdAt?: number; [key: string]: unknown };
+  events?: readonly unknown[];
+  snapshotEvents?: (fromSeq?: number, toSeqExclusive?: number) => readonly unknown[];
   inheritedEventCount?: number;
   append: (type: string, data: unknown, intent?: { surfaceOp?: "append" | { op: "replace"; startSeq: number; endSeq: number }; sourceEventSeqs?: number[] }) => { seq: number };
 }
@@ -67,6 +90,13 @@ interface OfficialUserMessage {
   source: { kind: string };
   text?: string;
 }
+
+type FactoryLifecycleOptions = {
+  agentOptions?: AgentOptions;
+  parentAgent?: unknown;
+  setup?: (ctx: unknown, agent: unknown) => Promise<{ commit?: () => void } | void> | { commit?: () => void } | void;
+  signal?: AbortSignal;
+};
 
 export interface NativePluginConfig {
   runtime?: RuntimeKind;
@@ -82,6 +112,10 @@ export interface NativePluginConfig {
 /**
  * Official DSH AgentFactory. createAgent(ownerCtx, options) / resume(ownerCtx, options)
  * match @deepseek-ai/dsh-agent so this can replace dsh-agent-loop.
+ *
+ * Resume MUST open the persisted log (`persistence.open`) rather than
+ * `persistence.create`. Sending a message on an existing session always
+ * resumes; create throws SessionAlreadyExistsError once the JSONL exists.
  */
 export class DshNativeFactory {
   constructor(
@@ -90,24 +124,128 @@ export class DshNativeFactory {
     private readonly config: NativePluginConfig = {},
   ) {}
 
-  async createAgent(ownerCtx: AnyCtx, options: { sessionId: string; agentOptions?: AgentOptions; meta?: { cwd?: string; agentPreset?: string }; seed?: unknown; inheritedEventCount?: number; parentAgent?: unknown; setup?: (ctx: unknown, agent: unknown) => Promise<{ commit?: () => void } | void> | void; signal?: AbortSignal }): Promise<AgentHandle> {
+  async createAgent(ownerCtx: AnyCtx, options: { sessionId: string; agentOptions?: AgentOptions; meta?: { cwd?: string; agentPreset?: string; [key: string]: unknown }; seed?: unknown; inheritedEventCount?: number; parentAgent?: unknown; setup?: FactoryLifecycleOptions["setup"]; signal?: AbortSignal }): Promise<AgentHandle> {
     ownerCtx.fiber?.assertActive?.();
+    const live = this.reuseLive(options.sessionId);
+    if (live) return live;
+
+    const attached = this.attachedSession(ownerCtx, options.sessionId);
+    if (attached) {
+      return this.publish(ownerCtx, options.sessionId, attached, options, undefined, "startup");
+    }
+
     const cwd = options.meta?.cwd && options.meta.cwd.startsWith("/") ? options.meta.cwd : process.cwd();
     const session = this.pluginCtx.sessions.prepare(options.sessionId, {
       ...options.seed === undefined ? {} : { seed: options.seed },
       ...options.inheritedEventCount === undefined ? {} : { inheritedEventCount: options.inheritedEventCount },
       meta: { cwd, ...options.meta },
     });
-    const persistence = this.pluginCtx.get?.("sessionPersistence");
-    const stored = persistence?.create
-      ? await persistence.create(session.header, {
-          inheritedEventCount: session.inheritedEventCount,
-          ...options.signal === undefined ? {} : { signal: options.signal },
-        })
-      : undefined;
+    const persistence = this.persistence(ownerCtx);
+    let stored: PersistenceHandle | undefined;
+    try {
+      stored = persistence?.create
+        ? await persistence.create(session.header, {
+            inheritedEventCount: session.inheritedEventCount,
+            ...options.signal === undefined ? {} : { signal: options.signal },
+          })
+        : undefined;
+    } catch (error) {
+      if (isAlreadyExists(error)) {
+        return this.resume(ownerCtx, {
+          resumeSessionId: options.sessionId,
+          agentOptions: options.agentOptions,
+          parentAgent: options.parentAgent,
+          setup: options.setup,
+          signal: options.signal,
+        });
+      }
+      throw error;
+    }
+    try {
+      return await this.publish(ownerCtx, options.sessionId, session, options, stored, "startup", 0);
+    } catch (error) {
+      await stored?.close?.().catch(() => {});
+      throw error;
+    }
+  }
+
+  async resume(ownerCtx: AnyCtx, options: { resumeSessionId: string; agentOptions?: AgentOptions; parentAgent?: unknown; setup?: FactoryLifecycleOptions["setup"]; signal?: AbortSignal }): Promise<AgentHandle> {
+    ownerCtx.fiber?.assertActive?.();
+    const id = options.resumeSessionId;
+    const live = this.reuseLive(id);
+    if (live) return live;
+
+    const attached = this.attachedSession(ownerCtx, id);
+    if (attached) {
+      const persistence = this.persistence(ownerCtx);
+      let stored: PersistenceHandle | undefined;
+      try {
+        stored = persistence?.open
+          ? await persistence.open(id, "write", options.signal === undefined ? undefined : { signal: options.signal })
+          : undefined;
+      } catch {
+        stored = undefined;
+      }
+      return this.publish(ownerCtx, id, attached, options, stored, "resume");
+    }
+
+    const persistence = this.persistence(ownerCtx);
+    if (!persistence?.open) {
+      throw new Error("cannot resume: session persistence is not configured (load a dsh-session-persistence backend)");
+    }
+    const handle = await persistence.open(id, "write", options.signal === undefined ? undefined : { signal: options.signal });
+    try {
+      const coldRead = await handle.read?.(
+        0,
+        Number.MAX_SAFE_INTEGER,
+        options.signal === undefined ? undefined : { signal: options.signal },
+      );
+      const persisted = Array.isArray(coldRead?.events) ? (coldRead!.events as unknown[]) : [];
+      const closers = interruptedClosers(persisted);
+      if (closers.length > 0 && handle.append) await handle.append(closers);
+      const eventState = coldRead?.eventState;
+      const session = this.pluginCtx.sessions.prepare(id, {
+        seed: [...persisted, ...closers],
+        meta: handle.header ? structuredClone(handle.header) : undefined,
+        inheritedEventCount: handle.inheritedEventCount,
+        ...(eventState === "detached" || eventState === "shared-frozen" ? { eventState } : {}),
+      });
+      return await this.publish(ownerCtx, id, session, options, handle, "resume", persisted.length + closers.length);
+    } catch (error) {
+      await handle.close?.().catch(() => {});
+      throw error;
+    }
+  }
+
+  private persistence(_ownerCtx: AnyCtx): SessionPersistence | undefined {
+    const value = this.pluginCtx.get?.("sessionPersistence");
+    if (!value || typeof value !== "object") return undefined;
+    return value as SessionPersistence;
+  }
+
+  private reuseLive(id: string): AgentHandle | undefined {
+    const agent = this.pluginCtx.agents.get?.(id);
+    if (!agent || typeof agent !== "object") return undefined;
+    if (!("followup" in agent)) return undefined;
+    return { agent: agent as never, dispose: async () => {} };
+  }
+
+  private attachedSession(_ownerCtx: AnyCtx, id: string): OfficialSession | undefined {
+    return this.pluginCtx.sessions.get?.(id);
+  }
+
+  private async publish(
+    ownerCtx: AnyCtx,
+    id: string,
+    session: OfficialSession,
+    options: FactoryLifecycleOptions,
+    stored: PersistenceHandle | undefined,
+    source: "startup" | "resume",
+    storedCount = 0,
+  ): Promise<AgentHandle> {
     const agent = new DshNativeAgent(
       this.pluginCtx,
-      options.sessionId,
+      id,
       options.agentOptions ?? {},
       session,
       this.client,
@@ -118,6 +256,7 @@ export class DshNativeFactory {
         const commit = await options.setup(agent.ctx, agent);
         commit?.commit?.();
       }
+      await flushUnstored(stored, session, storedCount);
     } catch (error) {
       await stored?.close?.().catch(() => {});
       await agent.scope.dispose().catch(() => {});
@@ -125,30 +264,38 @@ export class DshNativeFactory {
     }
     let detachSession: (() => void) | undefined;
     let detachAgent: (() => void) | undefined;
+    let unfollowOwner: (() => void) | undefined;
+    let disposing: Promise<void> | undefined;
     const dispose = async () => {
-      agent.cancel({ kind: "disposed" } as AgentCancelCause);
-      await agent.whenIdle();
-      detachAgent?.();
-      detachSession?.();
-      await stored?.close?.().catch(() => {});
-      await agent.scope.dispose();
+      disposing ??= (async () => {
+        agent.cancel({ kind: "disposed" } as AgentCancelCause);
+        await agent.whenIdle();
+        detachAgent?.();
+        detachSession?.();
+        await stored?.close?.().catch(() => {});
+        await agent.scope.dispose();
+        try {
+          unfollowOwner?.();
+        } catch {
+          /* owner fiber already tearing down */
+        }
+      })();
+      return disposing;
     };
-    detachSession = agent.ctx.sessions.enter(session);
-    detachAgent = this.pluginCtx.agents.enter(agent, options.parentAgent);
-    agent.ctx.sessions.announce(session);
-    this.pluginCtx.agents.announce(agent);
-    emitAgentEvent(agent.ctx as never, agent as never, "agent/session-start", { source: "startup" });
-    return { agent: agent as never, dispose };
-  }
-
-  async resume(ownerCtx: AnyCtx, options: { resumeSessionId: string; agentOptions?: AgentOptions; parentAgent?: unknown; setup?: (ctx: unknown, agent: unknown) => Promise<{ commit?: () => void } | void> | void; signal?: AbortSignal }): Promise<AgentHandle> {
-    return this.createAgent(ownerCtx, {
-      sessionId: options.resumeSessionId,
-      agentOptions: options.agentOptions,
-      parentAgent: options.parentAgent,
-      setup: options.setup,
-      signal: options.signal,
-    });
+    try {
+      unfollowOwner = ownerCtx.effect(() => () => {
+        void dispose();
+      }, `dsh-multica-runtime.lifecycle(${id})`) ?? undefined;
+      detachSession = agent.ctx.sessions.enter(session);
+      detachAgent = this.pluginCtx.agents.enter(agent, options.parentAgent);
+      agent.ctx.sessions.announce(session);
+      this.pluginCtx.agents.announce(agent);
+      emitAgentEvent(agent.ctx as never, agent as never, "agent/session-start", { source });
+      return { agent: agent as never, dispose };
+    } catch (error) {
+      await dispose().catch(() => {});
+      throw error;
+    }
   }
 }
 
@@ -185,6 +332,7 @@ class DshNativeAgent {
     this.client = client;
     this.config = config;
     this.catalog = config.catalog ?? { skills: [], mcp: [] };
+    this.turn = lastTurnNumber(sessionEvents(session));
     this.scope = createScope(ownerCtx as never, this as never) as never;
     this.ctx = this.scope.ctx;
     this.inbox = new NativeInbox((message, kind, turn) => {
@@ -224,6 +372,9 @@ class DshNativeAgent {
 
   cancel(cause: AgentCancelCause, options?: CancelOptions): void {
     this.cancelCause = cause;
+    if (cause && typeof cause === "object" && "kind" in cause && cause.kind === "disposed") {
+      this.disposed = true;
+    }
     if (!options?.keepInbox) this.inbox.clear();
     const segment = this.bindings.currentOrNull(this.id);
     if (segment?.currentTaskId) {
@@ -434,6 +585,82 @@ class NativeInbox {
     for (const message of claimed) this.notify(message, "claimed", turn);
     return claimed;
   }
+}
+
+function sessionEvents(session: OfficialSession): unknown[] {
+  if (typeof session.snapshotEvents === "function") {
+    try {
+      const snap = session.snapshotEvents();
+      return Array.isArray(snap) ? [...snap] : [];
+    } catch {
+      return [];
+    }
+  }
+  return Array.isArray(session.events) ? [...session.events] : [];
+}
+
+function lastTurnNumber(events: readonly unknown[]): number {
+  let turn = 0;
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue;
+    const rec = event as { type?: string; data?: { turn?: unknown } };
+    if (rec.type !== "turn/start" && rec.type !== "turn/end") continue;
+    const n = rec.data?.turn;
+    if (typeof n === "number" && Number.isFinite(n) && n > turn) turn = n;
+  }
+  return turn;
+}
+
+function interruptedClosers(events: unknown[]): unknown[] {
+  let openTurn: number | null = null;
+  let openStep: number | null = null;
+  let last: { seq: number; time: number } | null = null;
+  for (const event of events) {
+    if (!event || typeof event !== "object") continue;
+    const rec = event as { type?: string; seq?: number; time?: number; data?: { turn?: number; step?: number } };
+    if (typeof rec.seq === "number") {
+      last = { seq: rec.seq, time: typeof rec.time === "number" ? rec.time : 0 };
+    }
+    if (rec.type === "turn/start") {
+      openTurn = typeof rec.data?.turn === "number" ? rec.data.turn : openTurn;
+      openStep = null;
+    } else if (rec.type === "turn/end") {
+      openTurn = null;
+      openStep = null;
+    } else if (rec.type === "step/start") {
+      openStep = typeof rec.data?.step === "number" ? rec.data.step : openStep;
+    } else if (rec.type === "step/end") {
+      openStep = null;
+    }
+  }
+  if (openTurn === null || last === null) return [];
+  const closers: unknown[] = [];
+  let seq = last.seq + 1;
+  if (openStep !== null) {
+    closers.push({ type: "step/end", seq, time: last.time, data: { turn: openTurn, step: openStep } });
+    seq += 1;
+  }
+  closers.push({
+    type: "turn/end",
+    seq,
+    time: last.time,
+    data: { turn: openTurn, reason: { kind: "interrupted" } },
+  });
+  return closers;
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const name = "name" in error ? String(error.name) : "";
+  const message = "message" in error ? String(error.message) : String(error);
+  return name === "SessionAlreadyExistsError" || /already exists/i.test(message);
+}
+
+async function flushUnstored(stored: PersistenceHandle | undefined, session: OfficialSession, storedCount: number): Promise<void> {
+  if (!stored?.append) return;
+  const events = sessionEvents(session);
+  if (events.length <= storedCount) return;
+  await stored.append([...events.slice(storedCount)]);
 }
 
 export function applyNative(ctx: AnyCtx, client: MulticaClient, config: NativePluginConfig = {}): DshNativeFactory {

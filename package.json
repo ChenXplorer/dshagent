@@ -4,6 +4,7 @@
   "type": "module",
   "description": "DSH Multica Runtime plugin: replace dsh-agent-loop with official Multica Server/Daemon + Codex/Claude CLI",
   "scripts": {
-    "test": "node --experimental-strip-types --test src/plugin/plugin.test.ts src/multica/official.test.ts src/multica/control-plane.test.ts"
+    "test": "node --experimental-strip-types --test src/plugin/plugin.test.ts src/multica/official.test.ts src/multica/control-plane.test.ts",
+    "bundle": "esbuild dsh-multica-runtime/entry.ts --bundle --platform=node --format=esm --packages=external --outfile=dsh-multica-runtime/dist/index.js"
   }
 }
