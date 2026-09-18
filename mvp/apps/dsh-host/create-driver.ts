@@ -29,6 +29,9 @@ export interface DeploymentDriverConfiguration {
   dshSkillSources?: string[];
   /** Additional Daemons registered in the same Multica workspace. */
   runtimeTargets?: Array<RuntimeTarget & { mode: 'daytona' | 'local' | 'external'; workspacesRoot: string; label?: string }>;
+  /** Tenant policy copied from the Gateway: an empty runtimeIds list permits
+   * both native CLIs on that Daemon; a non-empty list is an exact allowlist. */
+  runtimeAllowlist?: Array<{ daemonId: string; runtimeIds: string[] }>;
   defaultRuntimeTarget?: RuntimeTarget;
 }
 
@@ -108,6 +111,20 @@ export async function createDriver(_input: { ctx?: unknown } = {}): Promise<Task
         return { executionStopped: true, transcriptFlushed: true };
       },
     });
+    // The official Multica catalog is workspace-wide. A DSH Web Host is
+    // tenant-scoped, so apply the Gateway's daemon policy here as well as in
+    // the public Gateway API; otherwise the input selector could expose old
+    // or another user's Runtime IDs.
+    const allowedTargets = config.runtimeAllowlist ?? [{ daemonId: config.daemon.daemonId, runtimeIds: [] }];
+    const isAllowed = (target: RuntimeTarget) => allowedTargets.some(item => item.daemonId === target.daemonId &&
+      (item.runtimeIds.length === 0 || item.runtimeIds.includes(target.runtimeId ?? '')));
+    const listRuntimes = driver.listRuntimes.bind(driver);
+    driver.listRuntimes = async () => (await listRuntimes()).filter(runtime => isAllowed(runtime));
+    const selectRuntime = driver.selectRuntime.bind(driver);
+    driver.selectRuntime = async (sessionId, selection) => {
+      if (typeof selection !== 'string' && !isAllowed(selection)) throw new Error('Runtime is not authorized for this user');
+      await selectRuntime(sessionId, selection);
+    };
     const ctx = _input.ctx as { effect?: (factory: () => () => void) => unknown } | undefined;
     if (typeof ctx?.effect === 'function') ctx.effect(() => () => repository.close());
     else process.once('exit', () => repository.close());

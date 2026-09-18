@@ -54,3 +54,17 @@ test('standard runtime rejects a registered Daemon from another Multica workspac
   const profileWithForeignDaemon = { ...profile, daemons: [{ id: 'foreign', userId: 'alice', label: 'Foreign', daemonId: 'foreign-daemon', workspaceId: 'other-workspace', runtimeIds: ['runtime'], workspacesRoot: 'C:/work', executionMode: 'local' as const, managed: false, status: 'online' as const, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }] };
   assert.throws(() => build({ stateDirectory: '/state', standardRuntime: config(override) } as any, { userId: 'alice', profile: profileWithForeignDaemon, sandboxId: 'sandbox', runtimeDirectory: '/state/alice', skillsFile: '/state/alice/skills.json' }), /different Multica workspace/);
 });
+
+test('standard runtime carries the tenant daemon allowlist into the DSH Host', () => {
+  const override = { alice: { multica: { localApiUrl: 'http://multica', token: 'alice-token', workspaceId: 'alice-workspace' }, daemonTemplate: { ...daemon('alice-daemon'), workspaceId: 'alice-workspace', token: 'alice-token' } } };
+  const scopedProfile = { ...profile, daemons: [
+    { id: 'sandbox', userId: 'alice', label: 'Platform', daemonId: 'alice-daemon-2bd806c97f0e00af', workspaceId: 'alice-workspace', runtimeIds: [], workspacesRoot: '/home/dsh/workspaces', executionMode: 'daytona' as const, managed: true, status: 'online' as const, createdAt: '', updatedAt: '' },
+    { id: 'desktop', userId: 'alice', label: 'Desktop', daemonId: 'desktop-daemon', workspaceId: 'alice-workspace', runtimeIds: ['claude-id', 'codex-id'], workspacesRoot: 'C:/work', executionMode: 'local' as const, managed: false, status: 'online' as const, createdAt: '', updatedAt: '' },
+    { id: 'revoked', userId: 'alice', label: 'Old', daemonId: 'old-daemon', workspaceId: 'alice-workspace', runtimeIds: ['old-id'], workspacesRoot: 'C:/old', executionMode: 'local' as const, managed: false, status: 'revoked' as const, createdAt: '', updatedAt: '' },
+  ] };
+  const result = build({ stateDirectory: '/state', standardRuntime: config(override) } as any, { userId: 'alice', profile: scopedProfile, sandboxId: 'sandbox', runtimeDirectory: '/state/alice', skillsFile: '/state/alice/skills.json' });
+  assert.deepEqual(result.runtimeAllowlist, [
+    { daemonId: 'alice-daemon-2bd806c97f0e00af', runtimeIds: [] },
+    { daemonId: 'desktop-daemon', runtimeIds: ['claude-id', 'codex-id'] },
+  ]);
+});

@@ -88,5 +88,7 @@ export function createStandardDriverConfiguration(config: MultiTenantDeploymentC
   // Sandbox and Task correlation is shared by the control plane and user Host
   // processes; userId/sessionId are the ownership keys inside that database.
   return { userId: input.userId, defaultRuntime: input.profile.defaultRuntime, maxConcurrentTasks, correlationDatabase: join(config.stateDirectory, 'correlation.db'), daytona: runtime.daytona, multica: perUser.multica, daemon,
-    managedSkillsFile: input.skillsFile, runtimeTargets: customTargets, defaultRuntimeTarget: { daemonId: daemon.daemonId, kind: input.profile.defaultRuntime } };
+    managedSkillsFile: input.skillsFile, runtimeTargets: customTargets,
+    runtimeAllowlist: input.profile.daemons.filter(item => item.status !== 'revoked').map(item => ({ daemonId: item.daemonId, runtimeIds: item.runtimeIds })),
+    defaultRuntimeTarget: { daemonId: daemon.daemonId, kind: input.profile.defaultRuntime } };
 }
