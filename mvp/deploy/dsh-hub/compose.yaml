@@ -1,0 +1,44 @@
+services:
+  hub:
+    # The upstream repository publishes the same image, but building from the
+    # pinned checkout is the reproducible default for a fresh deployment.  A
+    # reviewed immutable image may be supplied with DSH_HUB_IMAGE instead.
+    image: ${DSH_HUB_IMAGE:-dsh-hub:1.0.4-reviewed}
+    build:
+      context: ${DSH_HUB_SOURCE:-/opt/dsh-hub}
+      dockerfile: deploy/hub/Dockerfile
+      # The reviewed Ubuntu Docker instance intentionally has no predefined
+      # bridge network. BuildKit therefore uses the host network only for
+      # package downloads; the running Hub remains isolated by its service
+      # settings below.
+      network: host
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    ports:
+      - "127.0.0.1:${DSH_HUB_BIND_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      DSH_HUB_HOST: "0.0.0.0"
+      DSH_HUB_STATE_DIRECTORY: /var/lib/dsh-hub
+      DSH_HUB_STATIC_DIRECTORY: /app/public
+    volumes:
+      # The official image chmods its state root during startup. Named volumes
+      # preserve that contract under the reviewed Docker data-root (which is
+      # configured under /home on the target Ubuntu), including rootless mode.
+      - hub-state:/var/lib/dsh-hub
+      - hub-backups:/backup
+    stop_grace_period: 30s
+
+volumes:
+  hub-state:
+  hub-backups:

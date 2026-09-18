@@ -1,10 +1,10 @@
 # 企业 Agent 中台技术方案
 
-2026-09-12 · 面向约 200 名员工 · 概念设计
+2026-09-12 · 面向约 200 名员工 · 企业化目标架构
 
 **方案确定为：DSH 作为平台主基座，自研 Multica Runtime 插件，复用 Multica Server/Daemon 调度不同 CLI；沙箱作为独立的运行环境管理。**
 
-核心接入接口已核实，整体仍需开发适配插件并完成联调。本文描述目标架构，不代表现成组件已经完成整体集成。
+本文保留面向约 200 名员工的目标架构。当前 MVP 的真实模块、`ctx` 服务、插件生命周期和已验收边界见 [MVP 架构总览](../mvp/docs/architecture-overview.md)；不要把本文中的企业化能力清单当成已全部落地。
 
 ## 1. 整体架构与技术选型
 
@@ -42,7 +42,7 @@ flowchart TD
     T --> O["持久化存储与 Langfuse"]
 ```
 
-DSH 是逻辑上的最大基座。Multica 插件安装在 DSH 内，Multica Server、Daemon 则作为独立进程部署。
+DSH 是逻辑上的最大基座。Multica 插件安装在 DSH 内，Multica Server、Daemon 则作为独立进程部署。Daemon 是一台机器上的执行连接；同一 workspace 可以注册多个机器 Daemon，页面通过官方 `/api/runtimes` 读取并展示每个具体 CLI runtime。
 
 ## 2. Multica Runtime 插件
 
@@ -85,7 +85,7 @@ Multica 已实现各 CLI 的 Skill 目录注入，可以复用；但当前 Pi �
 - 工作目录：当前环境中的具体目录。
 - 能力：本次可用的 Skills、MCP。
 
-同一聊天切换时，保留 DSH Session，在当前任务完成或确认取消后，创建新的执行段，将历史摘要、必要消息、文件或 Git 变更交给目标 Runtime。
+同一聊天切换时，保留 DSH Session，并在当前任务完成或确认取消后调用 Multica 官方 Agent runtime 绑定更新。该会话只创建一个 Multica Agent、Project 和 Chat Session；本地新增执行段只做任务关联，DSH 每次发送当前 prompt，Chat 历史与目标 CLI provider session 的恢复/新建由 Multica 负责。切换到另一台 Daemon 时，Multica Project 增加该 Daemon 的目录资源，DSH 不做代码目录上传，也不伪造 handoff prompt。
 
 这里实现的是**同一会话连续工作**。不同 CLI 的内部会话状态不通用；跨机器文件也需要明确同步。Multica 的原生会话恢复依赖原会话仍存在且目标机器能够访问。[会话恢复说明](https://multica.ai/docs/providers)
 

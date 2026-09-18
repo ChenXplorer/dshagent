@@ -1,0 +1,8 @@
+{
+  "sha256": "4efbe8d35206d83801f1c64ba188ca3c3a62f4650ff58b832fae8726abce6044",
+  "sqlcVersion": "1.31.1",
+  "goVersion": "1.26.6",
+  "id": "dshtrace1",
+  "patch": "dshtrace1.patch",
+  "baseCommit": "8908fcfbc43d18fc515dec747a100fecccc33556"
+}

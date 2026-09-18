@@ -1,0 +1,12 @@
+{
+  "id": "dshtrace2",
+  "baseCommit": "8908fcfbc43d18fc515dec747a100fecccc33556",
+  "requires": "dshtrace1",
+  "requiresSha256": "4efbe8d35206d83801f1c64ba188ca3c3a62f4650ff58b832fae8726abce6044",
+  "patch": "dshtrace2.patch",
+  "sha256": "d0c7585c7aa74eb3618045b1ebad78ad050385520e14b44c5f939a2061f2008c",
+  "codexBaseSha256": "16aa871916bee3fe211f548d80f350892562fe2b7f6a64c4d889899c8de4a075",
+  "goVersion": "1.26.6",
+  "linuxBinary": "multica-linux-amd64-dshtrace2",
+  "linuxBinarySha256": "d191610e52ab66bebea22c70acdf8360b833d9f4c622be134b08cbc52110b6d7"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "@dshagent/tenant-control",
+  "private": true,
+  "type": "module"
+}

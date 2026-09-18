@@ -1,0 +1,7 @@
+{
+  "id": "management-profile-runtime-internal-auth-v4",
+  "patch": "management-profile-runtime.patch",
+  "sha256": "229f18907b4022ff61a133f0e2196ff5143d5c1d8dd950f4626125bc987ee240",
+  "baseCommit": "cc730d0091337767e437e0964c9f93ba3f490de7",
+  "upstreamVersion": "1.0.4"
+}

@@ -1,0 +1,78 @@
+{
+  "database": "/var/lib/dshagent/state/tenant.db",
+  "stateDirectory": "/var/lib/dshagent/state/hosts",
+  "listenHost": "0.0.0.0",
+  "port": 3380,
+  "mockUserId": "user-a",
+  "idleHostMs": 300000,
+  "operatorUserIds": ["operator-admin"],
+  "pluginPathRoots": ["/opt/dshagent/tenant-plugins"],
+  "allowUnmanagedPluginPaths": false,
+  "autoProvisionIdentity": false,
+  "hub": {
+    "baseUrl": "http://127.0.0.1:18090",
+    "internalOperatorToken": "<private-internal-operator-token-at-least-32-chars>",
+    "originSecret": "<private-hub-origin-secret-at-least-32-chars>",
+    "origin": "http://127.0.0.1:18090"
+  },
+  "requireHub": true,
+  "hubProfileTargetShards": [
+    { "nodeId": "tenant-node-a", "runtimeIdTemplate": "tenant-{userId}" },
+    { "nodeId": "tenant-node-b", "runtimeIdTemplate": "tenant-{userId}" }
+  ],
+  "standardRuntime": {
+    "daytona": {
+      "apiUrl": "http://127.0.0.1:33000/api",
+      "apiKey": "<private-daytona-api-key>",
+      "target": "local",
+      "snapshot": "<approved-dsh-multica-snapshot>"
+    },
+    "multica": {
+      "localApiUrl": "http://127.0.0.1:18381",
+      "token": "<private-multica-token>",
+      "workspaceId": "<per-deployment-workspace-id>"
+    },
+    "allowSharedMulticaWorkspace": false,
+    "userOverrides": {
+      "<user-id>": {
+        "multica": {
+          "localApiUrl": "http://127.0.0.1:18381",
+          "token": "<private-user-multica-token>",
+          "workspaceId": "<private-user-workspace-id>"
+        },
+        "daemonTemplate": {
+          "home": "/home/dsh",
+          "daemonId": "<private-user-daemon-id>",
+          "serverUrl": "https://multica.example.com",
+          "workspaceId": "<private-user-workspace-id>",
+          "token": "<private-user-multica-token>",
+          "workspacesRoot": "/home/dsh/workspaces",
+          "maxConcurrentTasks": 4,
+          "binaryLocalPath": "/var/lib/dshagent/artifacts/multica-linux-amd64",
+          "expectedDaemonVersion": "<pinned-version>",
+          "expectedCodexVersion": "<pinned-version>",
+          "expectedClaudeVersion": "<pinned-version>",
+          "nativeCli": {},
+          "secrets": {},
+          "requireEnhancedHealth": false
+        }
+      }
+    },
+    "daemonTemplate": {
+      "home": "/home/dsh",
+      "daemonId": "tenant-default",
+      "serverUrl": "https://multica.example.com",
+      "workspaceId": "<same-as-multica.workspaceId>",
+      "token": "<same-as-multica.token>",
+      "workspacesRoot": "/home/dsh/workspaces",
+      "maxConcurrentTasks": 4,
+      "binaryLocalPath": "/var/lib/dshagent/artifacts/multica-linux-amd64",
+      "expectedDaemonVersion": "<pinned-version>",
+      "expectedCodexVersion": "<pinned-version>",
+      "expectedClaudeVersion": "<pinned-version>",
+      "nativeCli": {},
+      "secrets": {},
+      "requireEnhancedHealth": false
+    }
+  }
+}

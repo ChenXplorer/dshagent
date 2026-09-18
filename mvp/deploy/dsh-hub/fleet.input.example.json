@@ -1,0 +1,33 @@
+{
+  "database": "/var/lib/dshagent/state/tenant.db",
+  "hostStateDirectory": "/var/lib/dshagent/state/hosts",
+  "maxProfilesPerNode": 64,
+  "nodes": [
+    {
+      "hubUrl": "http://127.0.0.1:19190",
+      "originSecret": "<private-origin-secret-at-least-32-characters>",
+      "nodeId": "tenant-node-a",
+      "runtimeIdTemplate": "tenant-{userId}",
+      "accessClientId": "tenant-node-a.internal",
+      "accessClientSecret": "<private-node-signing-secret-at-least-32-characters-a>",
+      "hubPublicKey": "<hub-public-key-returned-by-the-official-bootstrap-endpoint-node-a>",
+      "stateDirectory": "/var/lib/dshagent/hub-node-a",
+      "ipcEndpoint": "/var/lib/dshagent/hub-node-a/connector.sock",
+      "outputPath": "/var/lib/dshagent/hub-node-a/node-agent.next.json",
+      "dshExecutable": "/opt/dshagent/mvp/apps/dsh-host/dsh-cli-wrapper.mjs"
+    },
+    {
+      "hubUrl": "http://127.0.0.1:19190",
+      "originSecret": "<private-origin-secret-at-least-32-characters>",
+      "nodeId": "tenant-node-b",
+      "runtimeIdTemplate": "tenant-{userId}",
+      "accessClientId": "tenant-node-b.internal",
+      "accessClientSecret": "<private-node-signing-secret-at-least-32-characters-b>",
+      "hubPublicKey": "<hub-public-key-returned-by-the-official-bootstrap-endpoint-node-b>",
+      "stateDirectory": "/var/lib/dshagent/hub-node-b",
+      "ipcEndpoint": "/var/lib/dshagent/hub-node-b/connector.sock",
+      "outputPath": "/var/lib/dshagent/hub-node-b/node-agent.next.json",
+      "dshExecutable": "/opt/dshagent/mvp/apps/dsh-host/dsh-cli-wrapper.mjs"
+    }
+  ]
+}

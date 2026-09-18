@@ -1,0 +1,18 @@
+[Unit]
+Description=Official Multica Server for DSH multi-tenant execution
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dev/dshagent-mvp/runtime/multica-server
+EnvironmentFile=/home/dev/dshagent-mvp/runtime/multica-server/server.env
+ExecStart=/home/dev/dshagent-mvp/artifacts/multica-official/multica-server
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

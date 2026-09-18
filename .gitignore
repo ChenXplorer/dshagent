@@ -5,3 +5,9 @@ node_modules/
 *.token
 *.cookie
 dist/client.js
+bck/legacy-prototype/dsh-multica-runtime/dist/
+mvp/deploy/vendor/*.tgz
+# Local deployment handoff archives are reproducible from source and may carry
+# machine-specific build metadata; keep the Git repository source-only.
+mvp-*.tgz
+multica-official-*.tgz

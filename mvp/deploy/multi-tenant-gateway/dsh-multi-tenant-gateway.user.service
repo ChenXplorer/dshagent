@@ -1,0 +1,22 @@
+[Unit]
+Description=DSH multi-tenant Gateway (user service)
+Wants=network-online.target
+After=network-online.target dsh-hub-internal.service
+
+[Service]
+Type=simple
+# Replace both paths with versioned, owner-controlled deployment paths.
+WorkingDirectory=/home/dshagent/dshagent-mvp/current
+Environment=NODE_ENV=production
+Environment=DSH_TENANT_CONFIG=/home/dshagent/dshagent-mvp/runtime/tenant.config.json
+ExecStart=/usr/bin/env npm run start:tenant-gateway
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

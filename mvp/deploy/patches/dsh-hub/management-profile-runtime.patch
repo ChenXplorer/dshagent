@@ -1,0 +1,530 @@
+diff --git a/packages/hub/hub-node-agent/src/agent.ts b/packages/hub/hub-node-agent/src/agent.ts
+index 5162bfa..439a942 100644
+--- a/packages/hub/hub-node-agent/src/agent.ts
++++ b/packages/hub/hub-node-agent/src/agent.ts
+@@ -76,7 +76,7 @@ function flushWasRequested(connection: ActiveHubConnection): boolean {
+ 
+ function webSocketUrl(hubUrl: string, nodeId: string, bootId: string): string {
+   const url = new URL(hubUrl)
+-  url.protocol = 'wss:'
++  url.protocol = url.protocol === 'http:' ? 'ws:' : 'wss:'
+   url.pathname = '/hub/v1/agent'
+   url.search = new URLSearchParams({ nodeId, bootId }).toString()
+   return url.toString()
+@@ -351,7 +351,7 @@ export class HubNodeAgent {
+       this.installConnection(connection)
+       await this.flush(connection)
+       await this.recoverInbound(connection)
+-      for (const baseline of this.connector.baselines()) {
++      for (const baseline of this.runtimeBaselines()) {
+         this.pendingRuntimeStates.set(baseline.runtimeId, baseline)
+       }
+       this.drainPendingRuntimeStates()
+@@ -425,7 +425,7 @@ export class HubNodeAgent {
+     if (body.type === 'transport.ack') return true
+     if (body.type === 'runtime.resync-required') {
+       const targets = body.runtimeId === undefined
+-        ? this.connector.baselines().map(baseline => baseline.runtimeId)
++        ? this.runtimeBaselines().map(baseline => baseline.runtimeId)
+         : [body.runtimeId]
+       for (const runtimeId of targets) {
+         const coalescible = body.reason !== 'operator-request'
+@@ -517,11 +517,36 @@ export class HubNodeAgent {
+   }
+ 
+   private connectorDisconnected(runtimeId: string): void {
+-    this.pendingRuntimeStates.set(runtimeId, 'offline')
++    // A managed Profile remains addressable through the Node Agent even while
++    // its DSH Host/Connector is stopped. Only runtime-local capabilities leave;
++    // dsh.plugins/files/snapshots/terminals continue to be served here.
++    this.pendingRuntimeStates.set(runtimeId, this.managementBaseline(runtimeId) ?? 'offline')
+     this.drainPendingRuntimeStates()
+     this.requestFlush()
+   }
+ 
++  private managementBaseline(runtimeId: string): LocalRuntimeBaseline | undefined {
++    if (!this.supervisors.has(runtimeId)) return undefined
++    return {
++      runtimeId,
++      runtimeBootId: `${this.bootId}-${runtimeId}`,
++      connectorVersion: HUB_NODE_AGENT_VERSION,
++      dshVersion: 'managed-profile',
++      capabilities: [],
++    }
++  }
++
++  /** Connector data wins while a Host is running; otherwise advertise only Node-managed capabilities. */
++  private runtimeBaselines(): LocalRuntimeBaseline[] {
++    const baselines = new Map<string, LocalRuntimeBaseline>()
++    for (const runtimeId of this.supervisors.keys()) {
++      const baseline = this.managementBaseline(runtimeId)
++      if (baseline !== undefined) baselines.set(runtimeId, baseline)
++    }
++    for (const baseline of this.connector.baselines()) baselines.set(baseline.runtimeId, baseline)
++    return [...baselines.values()]
++  }
++
+   private connectorBody(body: HubEnvelopeBody): void {
+     if (body.type === 'stream.frame' && !isControlStream(body) && this.shouldSuppressStream()) {
+       this.recordDroppedStream(body)
+@@ -799,10 +824,16 @@ export class HubNodeAgent {
+   }
+ 
+   private accessHeaders(): Record<string, string> {
+-    return {
+-      'CF-Access-Client-Id': this.options.state.config.accessClientId,
+-      'CF-Access-Client-Secret': this.options.state.config.accessClientSecret,
+-    }
++    return this.options.state.config.originSecret === undefined
++      ? {
++          'CF-Access-Client-Id': this.options.state.config.accessClientId,
++          'CF-Access-Client-Secret': this.options.state.config.accessClientSecret,
++        }
++      : {
++          'x-dsh-internal-node-id': this.options.state.config.accessClientId,
++          'x-dsh-internal-node-secret': this.options.state.config.accessClientSecret,
++          'x-dsh-origin-secret': this.options.state.config.originSecret,
++        }
+   }
+ 
+   private notice(state: HubNodeAgentNotice['state'], message: string): void {
+diff --git a/packages/hub/hub-node-agent/src/bin.ts b/packages/hub/hub-node-agent/src/bin.ts
+index 97a3520..97eb629 100644
+--- a/packages/hub/hub-node-agent/src/bin.ts
++++ b/packages/hub/hub-node-agent/src/bin.ts
+@@ -43,8 +43,10 @@ async function command(program: string, args: string[]): Promise<void> {
+ 
+ async function initialize(args: readonly string[]): Promise<void> {
+   const hubUrl = new URL(requiredOption(args, '--hub'))
+-  if (hubUrl.protocol !== 'https:' || hubUrl.pathname !== '/' || hubUrl.search !== '' || hubUrl.hash !== '') {
+-    throw new Error('--hub must be an HTTPS origin without path, query, or fragment')
++  const loopbackHttp = hubUrl.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(hubUrl.hostname)
++  if ((hubUrl.protocol !== 'https:' && !loopbackHttp)
++    || hubUrl.pathname !== '/' || hubUrl.search !== '' || hubUrl.hash !== '') {
++    throw new Error('--hub must be an HTTPS origin or loopback HTTP origin without path, query, or fragment')
+   }
+   const accessClientId = requiredOption(args, '--access-client-id')
+   const accessClientSecret = process.env.DSH_HUB_ACCESS_CLIENT_SECRET?.trim()
+@@ -55,10 +57,18 @@ async function initialize(args: readonly string[]): Promise<void> {
+   if (enrollmentCode === undefined || enrollmentCode === '') {
+     throw new Error('DSH_HUB_ENROLLMENT_CODE is required for init')
+   }
++  const originSecret = process.env.DSH_HUB_ORIGIN_SECRET?.trim()
++  if (loopbackHttp && (originSecret === undefined || originSecret.length < 32)) {
++    throw new Error('DSH_HUB_ORIGIN_SECRET with at least 32 characters is required for loopback HTTP init')
++  }
+   const bootstrapResponse = await fetch(new URL('/hub/v1/bootstrap', hubUrl), {
+-    headers: {
++    headers: originSecret === undefined ? {
+       'CF-Access-Client-Id': accessClientId,
+       'CF-Access-Client-Secret': accessClientSecret,
++    } : {
++      'x-dsh-internal-node-id': accessClientId,
++      'x-dsh-internal-node-secret': accessClientSecret,
++      'x-dsh-origin-secret': originSecret,
+     },
+   })
+   const bootstrap = await readHubBootstrap(bootstrapResponse, accessClientId)
+@@ -69,6 +79,7 @@ async function initialize(args: readonly string[]): Promise<void> {
+   const runtimeId = option(args, '--runtime-id')?.trim() || 'default'
+   const config = {
+     hubUrl: hubUrl.origin,
++    ...(originSecret === undefined ? {} : { originSecret }),
+     nodeId: requiredOption(args, '--node'),
+     accessClientId,
+     accessClientSecret,
+diff --git a/packages/hub/hub-node-agent/src/state.ts b/packages/hub/hub-node-agent/src/state.ts
+index 4b1303a..a500d1c 100644
+--- a/packages/hub/hub-node-agent/src/state.ts
++++ b/packages/hub/hub-node-agent/src/state.ts
+@@ -21,6 +21,8 @@ export interface HubNodeManagementProfile {
+ /** Persistent Node Agent configuration. Secret-bearing files require mode 0600. */
+ export interface HubNodeAgentConfig {
+   hubUrl: string
++  /** Direct loopback internal mode only; external origin proxies inject this value. */
++  originSecret?: string
+   nodeId: HubNodeIdType
+   accessClientId: string
+   accessClientSecret: string
+@@ -37,7 +39,8 @@ export interface HubNodeAgentStateOptions {
+ }
+ 
+ const configSchema = z.strictObject({
+-  hubUrl: z.url().refine(value => new URL(value).protocol === 'https:', 'Hub URL must use HTTPS'),
++  hubUrl: z.url(),
++  originSecret: z.string().min(32).max(4_096).optional(),
+   nodeId: z.string().min(1).max(64),
+   accessClientId: z.string().min(1).max(512),
+   accessClientSecret: z.string().min(32).max(4_096),
+@@ -57,6 +60,18 @@ const configSchema = z.strictObject({
+       'management runtime IDs must be unique',
+     ),
+   }).optional(),
++}).superRefine((value, context) => {
++  const url = new URL(value.hubUrl)
++  const loopbackHttp = url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
++  if (url.protocol !== 'https:' && !loopbackHttp) {
++    context.addIssue({ code: 'custom', path: ['hubUrl'], message: 'Hub URL must use HTTPS or loopback HTTP' })
++  }
++  if (loopbackHttp && value.originSecret === undefined) {
++    context.addIssue({ code: 'custom', path: ['originSecret'], message: 'loopback HTTP requires originSecret' })
++  }
++  if (url.protocol === 'https:' && value.originSecret !== undefined) {
++    context.addIssue({ code: 'custom', path: ['originSecret'], message: 'originSecret is only accepted for loopback HTTP internal mode' })
++  }
+ })
+ 
+ async function ensurePrivateFile(path: string): Promise<void> {
+@@ -91,6 +106,7 @@ export async function loadHubNodeAgentConfig(path: string): Promise<HubNodeAgent
+   }
+   return {
+     hubUrl: raw.hubUrl,
++    ...(raw.originSecret === undefined ? {} : { originSecret: raw.originSecret }),
+     nodeId: HubNodeId(raw.nodeId),
+     accessClientId: raw.accessClientId,
+     accessClientSecret: raw.accessClientSecret,
+diff --git a/packages/hub/hub-node-agent/tests/state.spec.ts b/packages/hub/hub-node-agent/tests/state.spec.ts
+index 60bf44a..723ec5e 100644
+--- a/packages/hub/hub-node-agent/tests/state.spec.ts
++++ b/packages/hub/hub-node-agent/tests/state.spec.ts
+@@ -49,6 +49,32 @@ describe('Node Agent private state', () => {
+     await expect(HubNodeAgentState.open(configPath)).rejects.toThrow(/owner-only/)
+   })
+ 
++  it('permits direct HTTP only for a loopback internal Hub with an origin secret', async () => {
++    const root = await mkdtemp(join(tmpdir(), 'dsh-hub-node-loopback-'))
++    roots.push(root)
++    const configPath = join(root, 'node-agent.json')
++    const stateDirectory = join(root, 'state')
++    const base = {
++      nodeId: 'node-lab', accessClientId: 'node-lab.access',
++      accessClientSecret: 'service-token-secret-with-at-least-32-characters',
++      hubPublicKey: generateHubIdentity().publicKey, stateDirectory,
++      ipcEndpoint: join(stateDirectory, 'connector.sock'),
++    }
++    await writeFile(configPath, `${JSON.stringify({
++      ...base, hubUrl: 'http://127.0.0.1:19091',
++      originSecret: 'lab-origin-secret-with-at-least-32-characters',
++    })}\n`, { mode: 0o600 })
++    await expect(loadHubNodeAgentConfig(configPath)).resolves.toMatchObject({ hubUrl: 'http://127.0.0.1:19091' })
++
++    await writeFile(configPath, `${JSON.stringify({ ...base, hubUrl: 'http://127.0.0.1:19091' })}\n`, { mode: 0o600 })
++    await expect(loadHubNodeAgentConfig(configPath)).rejects.toThrow(/originSecret/)
++    await writeFile(configPath, `${JSON.stringify({
++      ...base, hubUrl: 'http://hub.example.com',
++      originSecret: 'lab-origin-secret-with-at-least-32-characters',
++    })}\n`, { mode: 0o600 })
++    await expect(loadHubNodeAgentConfig(configPath)).rejects.toThrow(/HTTPS or loopback HTTP/)
++  })
++
+   it('normalizes multiple managed profiles and rejects duplicate runtime or profile ownership', async () => {
+     const root = await mkdtemp(join(tmpdir(), 'dsh-hub-node-profiles-'))
+     roots.push(root)
+@@ -91,6 +117,47 @@ describe('Node Agent private state', () => {
+     await expect(loadHubNodeAgentConfig(configPath)).rejects.toThrow(/profile directories must be unique/)
+   })
+ 
++  it('advertises Node-managed Profile capabilities without requiring a live DSH Connector', async () => {
++    const root = await mkdtemp(join(tmpdir(), 'dsh-hub-node-managed-baseline-'))
++    roots.push(root)
++    const configPath = join(root, 'node-agent.json')
++    const stateDirectory = join(root, 'state')
++    await writeFile(configPath, `${JSON.stringify({
++      hubUrl: 'https://hub.example.com',
++      nodeId: 'node-managed',
++      accessClientId: 'node-token.access',
++      accessClientSecret: 'service-token-secret-with-at-least-32-characters',
++      hubPublicKey: generateHubIdentity().publicKey,
++      stateDirectory,
++      ipcEndpoint: join(stateDirectory, 'connector.sock'),
++      management: { profiles: [{
++        runtimeId: 'tenant-user-001', profileDirectory: join(root, 'profile-web'),
++        profileName: 'web', dshExecutable: 'dsh', snapshotPaths: [],
++      }] },
++    })}\n`, { mode: 0o600 })
++    const state = await HubNodeAgentState.open(configPath)
++    const agent = new HubNodeAgent({ state })
++    const internal = agent as unknown as {
++      runtimeBaselines(): Array<{ runtimeId: string; dshVersion: string; capabilities: unknown[] }>
++      connectorDisconnected(runtimeId: string): void
++    }
++    expect(internal.runtimeBaselines()).toMatchObject([{
++      runtimeId: 'tenant-user-001', dshVersion: 'managed-profile', capabilities: [],
++    }])
++
++    // A stopped Connector falls back to the management-only baseline instead
++    // of removing the Profile Runtime from Hub.
++    internal.connectorDisconnected('tenant-user-001')
++    expect(state.journal.pendingOutbound(16).at(-1)?.body).toMatchObject({
++      type: 'runtime.hello', runtimeId: 'tenant-user-001', dshVersion: 'managed-profile',
++      capabilities: [
++        { name: 'dsh.plugins' }, { name: 'dsh.snapshots' },
++        { name: 'dsh.files' }, { name: 'dsh.terminals' },
++      ],
++    })
++    state.close()
++  })
++
+   it('contains Connector callbacks at an exactly full durable outbox and retries runtime state after acknowledgement', async () => {
+     const outboxLimit = 64
+     const root = await mkdtemp(join(tmpdir(), 'dsh-hub-node-pressure-'))
+diff --git a/packages/hub/hub-server/src/auth.ts b/packages/hub/hub-server/src/auth.ts
+index e98d07c..fed4258 100644
+--- a/packages/hub/hub-server/src/auth.ts
++++ b/packages/hub/hub-server/src/auth.ts
+@@ -41,6 +41,15 @@ interface AccessPayload extends JWTPayload {
+   common_name?: string
+ }
+ 
++/** Explicit private-loopback credentials. Never selected by the upstream default. */
++export interface InternalAccessConfig {
++  humanToken: string
++  operatorEmail: string
++  serviceClientId: string
++  serviceClientSecret: string
++  ttlSeconds?: number
++}
++
+ /** Classified authentication failure safe for an HTTP status mapping. */
+ export class HubAuthError extends Error {
+   public constructor(public readonly code: 'missing' | 'invalid' | 'forbidden') {
+@@ -54,6 +63,57 @@ function singleHeader(headers: HubRequestHeaders, name: string): string | undefi
+   return Array.isArray(value) ? value[0] : value
+ }
+ 
++function secretMatches(expected: string, actual: string | undefined): boolean {
++  if (actual === undefined) return false
++  const left = createHash('sha256').update(expected, 'utf8').digest()
++  const right = createHash('sha256').update(actual, 'utf8').digest()
++  return timingSafeEqual(left, right)
++}
++
++/**
++ * Private loopback adapter for deployments where user authentication is handled elsewhere.
++ * The process entry permits it only with an explicit flag and loopback public origin.
++ */
++export class InternalAccessVerifier {
++  private readonly ttlSeconds: number
++
++  public constructor(private readonly config: InternalAccessConfig) {
++    if (config.humanToken.length < 32) throw new Error('internal operator token must contain at least 32 characters')
++    if (config.serviceClientId.trim().length === 0) throw new Error('internal node id is required')
++    if (config.serviceClientSecret.length < 32) throw new Error('internal node secret must contain at least 32 characters')
++    if (!/^[^@\s]+@[^@\s]+$/u.test(config.operatorEmail.trim())) throw new Error('internal operator email is invalid')
++    this.ttlSeconds = config.ttlSeconds ?? 3_600
++    if (!Number.isSafeInteger(this.ttlSeconds) || this.ttlSeconds < 60 || this.ttlSeconds > 86_400) {
++      throw new Error('internal auth ttlSeconds must be from 60 through 86400')
++    }
++  }
++
++  public async verifyHuman(headers: HubRequestHeaders): Promise<HubHumanPrincipal> {
++    const token = singleHeader(headers, 'x-dsh-internal-operator-token')
++    if (token === undefined) throw new HubAuthError('missing')
++    if (!secretMatches(this.config.humanToken, token)) throw new HubAuthError('invalid')
++    return {
++      kind: 'human',
++      email: this.config.operatorEmail.trim().toLowerCase(),
++      subject: 'internal-loopback-operator',
++      expiresAt: Math.floor(Date.now() / 1_000) + this.ttlSeconds,
++    }
++  }
++
++  public async verifyService(headers: HubRequestHeaders): Promise<HubServicePrincipal> {
++    const clientId = singleHeader(headers, 'x-dsh-internal-node-id')
++    const clientSecret = singleHeader(headers, 'x-dsh-internal-node-secret')
++    if (clientId === undefined || clientSecret === undefined) throw new HubAuthError('missing')
++    if (!secretMatches(this.config.serviceClientId, clientId)
++      || !secretMatches(this.config.serviceClientSecret, clientSecret)) throw new HubAuthError('invalid')
++    return {
++      kind: 'service',
++      commonName: this.config.serviceClientId,
++      expiresAt: Math.floor(Date.now() / 1_000) + this.ttlSeconds,
++    }
++  }
++}
++
+ function normalizeTeamDomain(value: string): string {
+   const domain = value.trim().toLowerCase()
+   if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.cloudflareaccess\.com$/.test(domain)) {
+diff --git a/packages/hub/hub-server/src/bin.ts b/packages/hub/hub-server/src/bin.ts
+index 6486be8..8001455 100644
+--- a/packages/hub/hub-server/src/bin.ts
++++ b/packages/hub/hub-server/src/bin.ts
+@@ -9,7 +9,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path'
+ import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
+ import { generateHubIdentity, HubNodeId, type HubIdentityKeyPair } from '@k1412/dsh-hub-protocol'
+ import { HubStorage } from '@k1412/dsh-hub-storage'
+-import { CloudflareAccessVerifier, HubOriginGuard } from './auth.ts'
++import { CloudflareAccessVerifier, HubOriginGuard, InternalAccessVerifier } from './auth.ts'
+ import { HubServer } from './server.ts'
+ 
+ function required(name: string): string {
+@@ -173,6 +173,26 @@ if (process.argv[2] === 'verify-backup') {
+   process.exit(0)
+ }
+ const operators = required('DSH_HUB_OPERATOR_EMAILS').split(',').map(value => value.trim()).filter(Boolean)
++const publicOrigin = required('DSH_HUB_PUBLIC_ORIGIN')
++const internalAuth = process.env.DSH_HUB_INTERNAL_AUTH?.trim() === 'true'
++if (internalAuth) {
++  const origin = new URL(publicOrigin)
++  if (origin.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(origin.hostname)) {
++    throw new Error('DSH_HUB_INTERNAL_AUTH requires an HTTP loopback DSH_HUB_PUBLIC_ORIGIN')
++  }
++}
++const access = internalAuth
++  ? new InternalAccessVerifier({
++      humanToken: required('DSH_HUB_INTERNAL_OPERATOR_TOKEN'),
++      operatorEmail: operators[0] ?? '',
++      serviceClientId: required('DSH_HUB_INTERNAL_NODE_ID'),
++      serviceClientSecret: required('DSH_HUB_INTERNAL_NODE_SECRET'),
++    })
++  : new CloudflareAccessVerifier({
++      teamDomain: required('DSH_HUB_CF_TEAM_DOMAIN'),
++      audience: required('DSH_HUB_CF_AUDIENCE'),
++      operatorEmails: operators,
++    })
+ 
+ let storage: HubStorage | undefined
+ let server: HubServer | undefined
+@@ -186,14 +206,10 @@ try {
+   storage.control.redactTerminalCommandContentBefore(Date.now() - 5 * 60_000)
+   server = new HubServer({
+     storage,
+-    access: new CloudflareAccessVerifier({
+-      teamDomain: required('DSH_HUB_CF_TEAM_DOMAIN'),
+-      audience: required('DSH_HUB_CF_AUDIENCE'),
+-      operatorEmails: operators,
+-    }),
++    access,
+     originGuard: new HubOriginGuard(required('DSH_HUB_ORIGIN_SECRET')),
+     hubIdentity: await identity(identityPath),
+-    publicOrigin: required('DSH_HUB_PUBLIC_ORIGIN'),
++    publicOrigin,
+     ...(process.env.DSH_HUB_STATIC_DIRECTORY?.trim()
+       ? { staticDirectory: resolve(process.env.DSH_HUB_STATIC_DIRECTORY.trim()) }
+       : {}),
+diff --git a/packages/hub/hub-server/src/server.ts b/packages/hub/hub-server/src/server.ts
+index 51bd7de..c848355 100644
+--- a/packages/hub/hub-server/src/server.ts
++++ b/packages/hub/hub-server/src/server.ts
+@@ -245,8 +245,9 @@ function sse(response: ServerResponse, event: HubBrowserEvent): void {
+ 
+ function normalizePublicOrigin(value: string): string {
+   const url = new URL(value)
+-  if (url.protocol !== 'https:' || url.username !== '' || url.password !== '' || url.pathname !== '/' || url.search !== '' || url.hash !== '') {
+-    throw new Error('publicOrigin must be an HTTPS origin without path, credentials, query, or fragment')
++  const loopbackHttp = url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
++  if ((url.protocol !== 'https:' && !loopbackHttp) || url.username !== '' || url.password !== '' || url.pathname !== '/' || url.search !== '' || url.hash !== '') {
++    throw new Error('publicOrigin must be an HTTPS origin or loopback HTTP origin without path, credentials, query, or fragment')
+   }
+   return url.origin
+ }
+diff --git a/packages/hub/hub-server/tests/auth.spec.ts b/packages/hub/hub-server/tests/auth.spec.ts
+index a69dc75..36d6969 100644
+--- a/packages/hub/hub-server/tests/auth.spec.ts
++++ b/packages/hub/hub-server/tests/auth.spec.ts
+@@ -1,6 +1,6 @@
+ import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from 'jose'
+ import { beforeAll, describe, expect, it } from 'vitest'
+-import { CloudflareAccessVerifier, HubAuthError, HubOriginGuard } from '../src/auth.ts'
++import { CloudflareAccessVerifier, HubAuthError, HubOriginGuard, InternalAccessVerifier } from '../src/auth.ts'
+ 
+ const issuer = 'https://example.cloudflareaccess.com'
+ const audience = 'application-audience'
+@@ -76,3 +76,35 @@ describe('private origin guard', () => {
+     expect(guard.permits({ 'x-dsh-origin-secret': secret })).toBe(true)
+   })
+ })
++
++describe('explicit loopback internal verifier', () => {
++  const humanToken = 'lab-human-token-with-at-least-32-characters'
++  const serviceClientSecret = 'lab-service-secret-with-at-least-32-characters'
++  const internal = () => new InternalAccessVerifier({
++    humanToken,
++    operatorEmail: 'Lab.Operator@example.com',
++    serviceClientId: 'node-lab.access',
++    serviceClientSecret,
++  })
++
++  it('accepts only the exact simulated human and service credentials', async () => {
++    await expect(internal().verifyHuman({ 'x-dsh-internal-operator-token': humanToken })).resolves.toMatchObject({
++      kind: 'human', email: 'lab.operator@example.com', subject: 'internal-loopback-operator',
++    })
++    await expect(internal().verifyService({
++      'x-dsh-internal-node-id': 'node-lab.access',
++      'x-dsh-internal-node-secret': serviceClientSecret,
++    })).resolves.toMatchObject({ kind: 'service', commonName: 'node-lab.access' })
++    await expect(internal().verifyHuman({ 'x-dsh-internal-operator-token': `${humanToken}-wrong` })).rejects.toMatchObject({ code: 'invalid' })
++    await expect(internal().verifyService({
++      'x-dsh-internal-node-id': 'node-lab.access', 'x-dsh-internal-node-secret': `${serviceClientSecret}-wrong`,
++    })).rejects.toMatchObject({ code: 'invalid' })
++  })
++
++  it('rejects weak internal credentials', () => {
++    expect(() => new InternalAccessVerifier({
++      humanToken: 'short', operatorEmail: 'operator@example.com',
++      serviceClientId: 'node-lab.access', serviceClientSecret,
++    })).toThrow(/operator token/)
++  })
++})
+diff --git a/packages/hub/hub-node-agent/src/supervisor.ts b/packages/hub/hub-node-agent/src/supervisor.ts
+--- a/packages/hub/hub-node-agent/src/supervisor.ts
++++ b/packages/hub/hub-node-agent/src/supervisor.ts
+@@ -572,7 +572,7 @@
+         try {
+           await this.restoreDependencyState(transaction)
+           await run(this.profile.dshExecutable, [
+-            'plugin', '--profile', this.profile.profileName, 'install', '--frozen-lockfile',
++            'plugin', '--profile', this.profile.profileName, 'install',
+           ], dirname(this.profile.profileDirectory))
+           change.status = 'failed-rolled-back'
+           change.error = error instanceof Error ? error.message : 'plugin update failed'
+@@ -592,7 +592,7 @@
+       if (change === undefined) throw new Error('plugin rollback version is unavailable')
+       const current = await this.lockHash()
+       if (change.status === 'rolled-back' && current === change.beforeLockHash) {
+-        const restored = await this.inventory() as { plugins: HubJson[]; lockHash: string }
++        const { checkedAt: _checkedAt, ...restored } = await this.inventory() as { plugins: HubJson[]; lockHash: string; checkedAt: number }
+         return { ...restored, change: this.publicPluginChange(change) }
+       }
+       if (current !== input.expectedLockHash) throw new Error('plugin lock changed before rollback')
+@@ -609,11 +609,17 @@
+       try {
+         await this.restoreDependencyState(transaction)
+         await run(this.profile.dshExecutable, [
+-          'plugin', '--profile', this.profile.profileName, 'install', '--frozen-lockfile',
++          'plugin', '--profile', this.profile.profileName, 'install',
+         ], dirname(this.profile.profileDirectory))
++        if (!await exists(join(transaction, 'pnpm-lock.yaml'))) {
++          await rm(join(this.profile.profileDirectory, 'pnpm-lock.yaml'), { force: true })
++        }
+         const restored = await this.inventory() as { plugins: HubJson[]; lockHash: string }
+-        if (restored.lockHash !== change.beforeLockHash || restored.plugins.some(plugin =>
+-          typeof plugin !== 'object' || plugin === null || Array.isArray(plugin) || plugin.healthy !== true)) {
++        const remaining = restored.plugins.filter(plugin =>
++          typeof plugin === 'object' && plugin !== null && !Array.isArray(plugin)
++          && (plugin as { packageName?: unknown }).packageName !== change.packageName)
++        if (restored.lockHash !== change.beforeLockHash || remaining.some(plugin =>
++          (plugin as { healthy?: unknown }).healthy !== true)) {
+           throw new Error('plugin rollback did not restore the recorded healthy inventory')
+         }
+         change.status = 'rolled-back'
+@@ -621,9 +627,15 @@
+         change.rollbackMutationId = String(input.clientMutationId)
+         delete change.error
+         await this.writePluginChanges(changes)
+-        return { ...restored, change: this.publicPluginChange(change) }
++        const managed = await readJson<ManagedPlugin[]>(this.managedPath, [])
++        await writeFileAtomic(this.managedPath, `${JSON.stringify(managed.filter(plugin => plugin.packageName !== change.packageName), null, 2)}\n`, {
++          mode: 0o600,
++          dirMode: 0o700,
++        })
++        const { checkedAt: _checkedAt, ...finalInventory } = await this.inventory() as { plugins: HubJson[]; lockHash: string; checkedAt: number }
++        return { ...finalInventory, change: this.publicPluginChange(change) }
+       } catch (error) {
+         await this.restoreDependencyState(rollbackGuard)
+         await run(this.profile.dshExecutable, [
+-          'plugin', '--profile', this.profile.profileName, 'install', '--frozen-lockfile',
++          'plugin', '--profile', this.profile.profileName, 'install',
+         ], dirname(this.profile.profileDirectory)).catch((guardError: unknown) => {
+           throw new AggregateError([error, guardError], 'plugin rollback and rollback recovery both failed')

@@ -1,0 +1,111 @@
+diff --git a/server/pkg/agent/codex.go b/server/pkg/agent/codex.go
+index 9239085..e55d48f 100644
+--- a/server/pkg/agent/codex.go
++++ b/server/pkg/agent/codex.go
+@@ -1393,6 +1393,14 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
+ 			// Wait returning with a ProcessState is the os/exec reap boundary.
+ 			// On Unix, ProcessState.Exited reports false for a process terminated
+ 			// by SIGKILL even though Wait successfully reaped it.
++			// A clean app-server exit can leave background helpers (for example
++			// the native plugin-catalog git fetch) in this launch's owned group.
++			// Cancel after Wait does not invoke exec.Cmd.Cancel, so explicitly
++			// stop the remaining group before observing its disappearance. The
++			// group/job belongs to this launch; concurrent tasks are unaffected.
++			if waitReturned && cmd.ProcessState != nil {
++				signalProcessGroup(cmd, syscall.SIGKILL)
++			}
+ 			cleanupConfirmed = waitReturned && cmd.ProcessState != nil && waitProcessGroupGone(cmd, grace)
+ 			if codexCleanupConfirmationOverride.Load() < 0 {
+ 				cleanupConfirmed = false
+diff --git a/server/pkg/agent/codex_orphan_cleanup_unix_test.go b/server/pkg/agent/codex_orphan_cleanup_unix_test.go
+new file mode 100644
+index 0000000..07bdc75
+--- /dev/null
++++ b/server/pkg/agent/codex_orphan_cleanup_unix_test.go
+@@ -0,0 +1,86 @@
++//go:build unix
++
++package agent
++
++import (
++	"context"
++	"fmt"
++	"log/slog"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// The real app-server may spawn a plugin-catalog git fetch with closed stdio.
++// Its main process exits normally while that helper stays alive in its group.
++// Both terminal paths must stop the helper without signalling another launch.
++func TestCodexOrphanCleanupPreservesSibling(t *testing.T) {
++	for _, interrupted := range []bool{false, true} {
++		t.Run(fmt.Sprintf("interrupted=%t", interrupted), func(t *testing.T) {
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			siblingCtx, siblingCancel := context.WithCancel(context.Background())
++			sibling := NewCommand("/bin/sh", nil).exec(siblingCtx, "-c", "exec sleep 300")
++			if err := startOwnedProcessTree(sibling, slog.Default()); err != nil {
++				t.Fatal(err)
++			}
++			defer func() { siblingCancel(); _ = sibling.Wait(); releaseProcessGroup(sibling) }()
++			pidFile := filepath.Join(t.TempDir(), "owned-pids")
++			body := `sleep 300 </dev/null >/dev/null 2>&1 &
++helper=$!
++read line
++echo '{"jsonrpc":"2.0","id":1,"result":{}}'
++read line
++read line
++echo '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr-owned"}}}'
++read line
++echo '{"jsonrpc":"2.0","id":3,"result":{}}'
++echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr-owned","turn":{"id":"turn-owned"}}}'
++` + fmt.Sprintf("printf '%%s %%s\\n' \"$$\" \"$helper\" > %q\n", pidFile)
++			status := "completed"
++			if interrupted {
++				body += "read line\necho '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}'\n"
++				status = "interrupted"
++			}
++			body += fmt.Sprintf("echo '{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thr-owned\",\"turn\":{\"id\":\"turn-owned\",\"status\":%q}}}'\n", status)
++			body += "while read line; do :; done\n"
++			fakePath := writeFakeCodexAppServer(t, body)
++			backend, err := New("codex", Config{ExecutablePath: fakePath, Logger: slog.Default()})
++			if err != nil {
++				t.Fatal(err)
++			}
++			session, err := backend.Execute(ctx, "prompt", ExecOptions{Timeout: 15 * time.Second})
++			if err != nil {
++				t.Fatal(err)
++			}
++			go func() {
++				for range session.Messages {
++				}
++			}()
++			pids := waitForPids(t, pidFile)
++			defer func() { _ = syscall.Kill(-pids[0], syscall.SIGKILL) }()
++			if interrupted {
++				cancel()
++			}
++			select {
++			case result := <-session.Result:
++				want := "completed"
++				if interrupted {
++					want = "aborted"
++				}
++				if result.Status != want {
++					t.Fatalf("status = %q, want %q: %s", result.Status, want, result.Error)
++				}
++			case <-time.After(20 * time.Second):
++				t.Fatal("Codex lifecycle failed to finish")
++			}
++			for _, pid := range pids {
++				waitProcessGone(t, pid)
++			}
++			if err := syscall.Kill(sibling.Process.Pid, 0); err != nil {
++				t.Fatalf("cleanup affected another runtime launch: %v", err)
++			}
++		})
++	}
++}

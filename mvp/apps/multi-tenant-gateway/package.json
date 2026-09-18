@@ -1,0 +1,5 @@
+{
+  "name": "@dshagent/multi-tenant-gateway",
+  "private": true,
+  "type": "module"
+}

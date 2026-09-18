@@ -1,0 +1,41 @@
+[Unit]
+Description=DSH multi-tenant Gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=dshagent
+Group=dshagent
+WorkingDirectory=/opt/dshagent/mvp
+Environment=NODE_ENV=production
+Environment=DSH_TENANT_CONFIG=/etc/dshagent/tenant.config.json
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Optional deployment override for a versioned Node installation, for example
+# PATH=/opt/node-v24/bin:/usr/local/bin:/usr/bin:/bin. Keep this file root-owned.
+EnvironmentFile=-/etc/dshagent/gateway.env
+ExecStart=/usr/bin/env npm run start:tenant-gateway
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+# DSH Host child processes inherit this limit. Filesystem watcher capacity is
+# configured separately by 90-dshagent-host-watches.conf.
+LimitNOFILE=65536
+
+# The Gateway writes only tenant state, versioned Host state and logs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/var/lib/dshagent /var/log/dshagent
+StateDirectory=dshagent
+LogsDirectory=dshagent
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+{
+  "name": "dshagent-multica-db",
+  "services": {
+    "postgres": {
+      "image": "postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73",
+      "ports": ["127.0.0.1:35432:5432"],
+      "environment": {
+        "POSTGRES_USER": "multica",
+        "POSTGRES_PASSWORD": "${MULTICA_DB_PASSWORD:?required}",
+        "POSTGRES_DB": "multica"
+      },
+      "volumes": ["${MULTICA_DB_DATA:?required}:/var/lib/postgresql/data"],
+      "networks": ["mvp"],
+      "restart": "unless-stopped",
+      "mem_limit": "512m",
+      "healthcheck": {
+        "test": ["CMD-SHELL", "pg_isready -U multica -d multica"],
+        "interval": "5s", "timeout": "3s", "retries": 20
+      },
+      "logging": {"driver": "local", "options": {"max-size": "10m", "max-file": "3"}}
+    }
+  },
+  "networks": {"mvp": {"external": true, "name": "dshagent-daytona"}}
+}

@@ -1,0 +1,1066 @@
+diff --git a/packages/core/api/schemas.ts b/packages/core/api/schemas.ts
+index 9163aad..6a94fe3 100644
+--- a/packages/core/api/schemas.ts
++++ b/packages/core/api/schemas.ts
+@@ -1812,6 +1812,7 @@ export const AgentTaskListSchema = z.array(AgentTaskSchema);
+ // field to "unknown" is the correct loss; deleting the run is not. Every other
+ // field keeps a default for the same reason.
+ export const TaskMessagePayloadSchema = z.object({
++  call_id: z.string().optional().catch(undefined),
+   task_id: z.string().default(""),
+   issue_id: z.string().default(""),
+   chat_session_id: z.string().optional(),
+diff --git a/packages/core/types/events.ts b/packages/core/types/events.ts
+index efc79dc..08dd931 100644
+--- a/packages/core/types/events.ts
++++ b/packages/core/types/events.ts
+@@ -285,6 +285,8 @@ export interface ActivityCreatedPayload {
+ }
+ 
+ export interface TaskMessagePayload {
++  /** Genuine provider tool invocation ID; older daemons omit it. */
++  call_id?: string;
+   task_id: string;
+   issue_id: string;
+   chat_session_id?: string;
+diff --git a/server/cmd/migrate/main.go b/server/cmd/migrate/main.go
+index 0e3cfa7..d072401 100644
+--- a/server/cmd/migrate/main.go
++++ b/server/cmd/migrate/main.go
+@@ -306,6 +306,7 @@ var concurrentIndexCleanups = map[string]string{
+ 	"466_activity_log_member_assignee_frequency_index":          "idx_activity_log_member_assignee_frequency",
+ 	"472_agent_task_queue_chat_session_index":                   "idx_agent_task_queue_chat_session",
+ 	"474_dingtalk_bot_identity_workspace_index":                 "idx_dingtalk_bot_identity_workspace",
++	"479_task_message_sequence_unique":                          "task_message_task_seq_unique",
+ }
+ 
+ // concurrentDownIndexCleanups covers every migration whose down direction
+diff --git a/server/internal/daemon/client.go b/server/internal/daemon/client.go
+index c57e806..b91c484 100644
+--- a/server/internal/daemon/client.go
++++ b/server/internal/daemon/client.go
+@@ -14,6 +14,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/multica-ai/multica/server/internal/daemon/transcriptoutbox"
+ 	"github.com/multica-ai/multica/server/pkg/agent"
+ 	"github.com/multica-ai/multica/server/pkg/protocol"
+ 	"github.com/multica-ai/multica/server/pkg/remotemcp"
+@@ -92,9 +93,10 @@ func isRuntimeNotFoundError(err error) bool {
+ 
+ // Client handles HTTP communication with the Multica server daemon API.
+ type Client struct {
+-	baseURL string
+-	token   string
+-	client  *http.Client
++	transcriptOutbox *transcriptoutbox.Store
++	baseURL          string
++	token            string
++	client           *http.Client
+ 
+ 	// bundleClient downloads skill bundles. Unlike client it carries no fixed
+ 	// Timeout: bundles can be large and slow on jittery links, so the caller
+@@ -509,6 +511,7 @@ func (c *Client) ReportProgress(ctx context.Context, taskID, summary string, ste
+ 
+ // TaskMessageData represents a single agent execution message for batch reporting.
+ type TaskMessageData struct {
++	CallID  string         `json:"call_id,omitempty"`
+ 	Seq     int            `json:"seq"`
+ 	Type    string         `json:"type"`
+ 	Tool    string         `json:"tool,omitempty"`
+@@ -526,6 +529,9 @@ type TaskMessageData struct {
+ }
+ 
+ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages []TaskMessageData) error {
++	if c.transcriptOutbox != nil {
++		return c.reportDurableTaskMessages(ctx, taskID, messages)
++	}
+ 	return c.postJSON(ctx, fmt.Sprintf("/api/daemon/tasks/%s/messages", taskID), map[string]any{
+ 		"messages": messages,
+ 	}, nil)
+diff --git a/server/internal/daemon/daemon.go b/server/internal/daemon/daemon.go
+index 33a966d..2620d24 100644
+--- a/server/internal/daemon/daemon.go
++++ b/server/internal/daemon/daemon.go
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/multica-ai/multica/server/internal/cli"
+ 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
+ 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
++	"github.com/multica-ai/multica/server/internal/daemon/transcriptoutbox"
+ 	"github.com/multica-ai/multica/server/internal/selfexec"
+ 	"github.com/multica-ai/multica/server/pkg/agent"
+ 	"github.com/multica-ai/multica/server/pkg/redact"
+@@ -618,8 +619,9 @@ type Daemon struct {
+ 	// race where a new task slipping in during the release-metadata fetch
+ 	// would be cancelled by triggerRestart's root-ctx cancel.
+ 	claimMu        sync.Mutex
+-	pauseClaims    bool // when true, the batch poller skips claiming
+-	claimsInFlight int  // pollers that have decided to claim but haven't yet handed the task off to handleTask
++	pauseClaims    bool                // when true, the batch poller skips claiming
++	claimsInFlight int                 // pollers that have decided to claim but haven't yet handed the task off to handleTask
++	activeTaskIDs  map[string]struct{} // guarded by claimMu; includes preparation and cleanup
+ 
+ 	activeEnvRootsMu   sync.Mutex
+ 	activeEnvRootsCond *sync.Cond      // signalled when an in-flight env-root GC mutation finishes
+@@ -690,6 +692,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
+ 	cacheRoot := filepath.Join(cfg.WorkspacesRoot, ".repos")
+ 	skillCacheRoot := filepath.Join(cfg.WorkspacesRoot, ".skill-cache", "v1")
+ 	client := NewClient(cfg.ServerBaseURL)
++	client.transcriptOutbox = transcriptoutbox.New(cfg.WorkspacesRoot, cfg.ServerBaseURL+"\n"+cfg.DaemonID+"\n"+cfg.Profile)
+ 	// Tag every daemon HTTP request with the daemon's CLI version so the
+ 	// server can split logs/metrics by client version (parallel to the CLI).
+ 	client.SetVersion(cfg.CLIVersion)
+@@ -2135,6 +2138,7 @@ func (d *Daemon) Run(ctx context.Context) error {
+ 
+ 	// Start workspace sync loop to discover newly created workspaces.
+ 	go d.workspaceSyncLoop(ctx)
++	go d.transcriptReplayLoop(ctx)
+ 
+ 	// Discover agent CLIs installed after startup (MUL-5439). Separate from the
+ 	// workspace sync loop because that one runs on a thirty-minute consistency
+@@ -5460,6 +5464,12 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
+ 			d.logger.Info("task received", "task", t.ID, "target", taskTarget)
+ 			taskWG.Add(1)
+ 			d.activeTasks.Add(1)
++			d.claimMu.Lock()
++			if d.activeTaskIDs == nil {
++				d.activeTaskIDs = make(map[string]struct{})
++			}
++			d.activeTaskIDs[t.ID] = struct{}{}
++			d.claimMu.Unlock()
+ 			if cache, ok := d.repoCache.(interface{ CancelMaintenance() }); ok {
+ 				// A task can reuse an existing worktree and never enter the
+ 				// checkout path that normally preempts repository maintenance.
+@@ -5470,6 +5480,11 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
+ 			go func(t Task, slot int) {
+ 				defer taskWG.Done()
+ 				defer d.activeTasks.Add(-1)
++				defer func() {
++					d.claimMu.Lock()
++					delete(d.activeTaskIDs, t.ID)
++					d.claimMu.Unlock()
++				}()
+ 				defer func() {
+ 					// Release local capacity before waking the poller. The task's
+ 					// terminal callback and local cleanup have both finished at this
+@@ -9294,6 +9309,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
+ 	// message batch, so the result hand-off below can wait for the transcript
+ 	// tail to be persisted.
+ 	drainFinished := make(chan struct{})
++	var transcriptPersistenceFailure atomic.Pointer[error]
+ 	go func() {
+ 		defer close(drainFinished)
+ 		var mu sync.Mutex
+@@ -9335,7 +9351,15 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
+ 			if len(toSend) > 0 {
+ 				sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 				if err := d.client.ReportTaskMessages(sendCtx, taskID, toSend); err != nil {
+-					taskLog.Debug("failed to report task messages", "error", err)
++					taskLog.Warn("task transcript delivery pending", "error", err)
++					var persistenceError *TranscriptPersistenceError
++					if errors.As(err, &persistenceError) {
++						transcriptPersistenceFailure.Store(&err)
++						mu.Lock()
++						batch = append(toSend, batch...)
++						mu.Unlock()
++						agentCancel()
++					}
+ 				} else {
+ 					taskLog.Debug("reported task messages", "count", len(toSend), "last_seq", toSend[len(toSend)-1].Seq)
+ 				}
+@@ -9428,6 +9452,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
+ 					batch = append(batch, TaskMessageData{
+ 						Seq:       int(s),
+ 						Type:      "tool_use",
++						CallID:    msg.CallID,
+ 						Tool:      msg.Tool,
+ 						CreatedAt: observedAt,
+ 						// Redact before the payload leaves this process, not
+@@ -9470,6 +9495,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
+ 					batch = append(batch, TaskMessageData{
+ 						Seq:       int(s),
+ 						Type:      "tool_result",
++						CallID:    msg.CallID,
+ 						Tool:      toolName,
+ 						Output:    output,
+ 						CreatedAt: observedAt,
+@@ -9551,6 +9577,9 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
+ 	case result := <-session.Result:
+ 		stopWatchdog()
+ 		waitForDrain()
++		if err := transcriptPersistenceFailure.Load(); err != nil {
++			return agent.Result{Status: "error", Error: "task transcript persistence failed"}, toolCount.Load(), *err
++		}
+ 		// terminalObserved outranks a watchdog that fired anyway: if the backend
+ 		// had already read its authoritative result, this is the real outcome and
+ 		// re-tagging it would report a completed run as a hang.
+@@ -9573,6 +9602,9 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
+ 		// transcript either.
+ 		waitForDrain()
+ 		// Idle watchdog cancels via agentCancel(), which propagates here as
++		if err := transcriptPersistenceFailure.Load(); err != nil {
++			return agent.Result{Status: "error", Error: "task transcript persistence failed"}, toolCount.Load(), *err
++		}
+ 		// context.Canceled. Check this BEFORE the generic cancelled/timeout
+ 		// classifiers so a watchdog-induced stop isn't misreported as
+ 		// "task cancelled by server".
+diff --git a/server/internal/daemon/health.go b/server/internal/daemon/health.go
+index 1b4c263..00f89ff 100644
+--- a/server/internal/daemon/health.go
++++ b/server/internal/daemon/health.go
+@@ -18,8 +18,12 @@ import (
+ 
+ // HealthResponse is returned by the daemon's local health endpoint.
+ type HealthResponse struct {
+-	Status string `json:"status"`
+-	PID    int    `json:"pid"`
++	ActiveTaskIDs           []string       `json:"active_task_ids"`
++	ClaimsInFlight          int            `json:"claims_in_flight"`
++	TranscriptPendingByTask map[string]int `json:"transcript_pending_by_task"`
++	TranscriptOutboxError   bool           `json:"transcript_outbox_error"`
++	Status                  string         `json:"status"`
++	PID                     int            `json:"pid"`
+ 	// OS is the daemon's runtime.GOOS. The desktop app compares it against its
+ 	// own host OS to detect a daemon it cannot manage — e.g. a Windows desktop
+ 	// reaching a Linux daemon inside WSL2 over localhost forwarding. The
+@@ -353,6 +357,20 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
+ 			resp.RepoMaintenanceActive = activity.MaintenanceActive
+ 			resp.RepoCheckoutWaiters = activity.ForegroundWaiters
+ 		}
++		if d.client != nil && d.client.transcriptOutbox != nil {
++			pending, err := d.client.transcriptOutbox.Pending()
++			resp.TranscriptPendingByTask = pending
++			resp.TranscriptOutboxError = err != nil
++		} else {
++			resp.TranscriptOutboxError = true
++		}
++		d.claimMu.Lock()
++		resp.ActiveTaskIDs = make([]string, 0, len(d.activeTaskIDs))
++		for taskID := range d.activeTaskIDs {
++			resp.ActiveTaskIDs = append(resp.ActiveTaskIDs, taskID)
++		}
++		resp.ClaimsInFlight = d.claimsInFlight
++		d.claimMu.Unlock()
+ 
+ 		w.Header().Set("Content-Type", "application/json")
+ 		json.NewEncoder(w).Encode(resp)
+diff --git a/server/internal/daemon/transcript_outbox.go b/server/internal/daemon/transcript_outbox.go
+new file mode 100644
+index 0000000..c6ecf5f
+--- /dev/null
++++ b/server/internal/daemon/transcript_outbox.go
+@@ -0,0 +1,63 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"time"
++
++	"github.com/multica-ai/multica/server/internal/daemon/transcriptoutbox"
++	"github.com/multica-ai/multica/server/pkg/redact"
++)
++
++type TranscriptPersistenceError struct{ Err error }
++
++func (e *TranscriptPersistenceError) Error() string {
++	return "persist task transcript: " + e.Err.Error()
++}
++func (e *TranscriptPersistenceError) Unwrap() error { return e.Err }
++
++func (c *Client) transcriptSender(ctx context.Context, envelope transcriptoutbox.Envelope) error {
++	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
++	defer cancel()
++	return c.postJSON(sendCtx, fmt.Sprintf("/api/daemon/tasks/%s/messages", envelope.TaskID), map[string]any{
++		"messages": envelope.Messages,
++	}, nil)
++}
++
++func (c *Client) reportDurableTaskMessages(ctx context.Context, taskID string, messages []TaskMessageData) error {
++	redacted := make([]TaskMessageData, len(messages))
++	for i, message := range messages {
++		message.Content = redact.Text(message.Content)
++		message.Output = redact.Text(message.Output)
++		message.Input = redact.InputMap(message.Input)
++		redacted[i] = message
++	}
++	payload, err := json.Marshal(redacted)
++	if err != nil {
++		return &TranscriptPersistenceError{Err: err}
++	}
++	path, err := c.transcriptOutbox.Persist(taskID, payload)
++	if err != nil {
++		return &TranscriptPersistenceError{Err: err}
++	}
++	return c.transcriptOutbox.Deliver(ctx, path, c.transcriptSender)
++}
++
++func (d *Daemon) transcriptReplayLoop(ctx context.Context) {
++	ticker := time.NewTicker(2 * time.Second)
++	defer ticker.Stop()
++	for {
++		drainCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
++		err := d.client.transcriptOutbox.Drain(drainCtx, d.client.transcriptSender)
++		cancel()
++		if err != nil && ctx.Err() == nil {
++			d.logger.Warn("task transcript delivery pending", "error", err)
++		}
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++		}
++	}
++}
+diff --git a/server/internal/daemon/transcript_outbox_test.go b/server/internal/daemon/transcript_outbox_test.go
+new file mode 100644
+index 0000000..0499e4d
+--- /dev/null
++++ b/server/internal/daemon/transcript_outbox_test.go
+@@ -0,0 +1,83 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"log/slog"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/multica-ai/multica/server/internal/daemon/transcriptoutbox"
++)
++
++func TestTranscriptClientRetainsFailedBatchAndReplaysWithCallID(t *testing.T) {
++	var attempts atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		var body struct {
++			Messages []TaskMessageData `json:"messages"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			t.Error(err)
++		}
++		if len(body.Messages) != 1 || body.Messages[0].CallID != "genuine-call-id" {
++			t.Errorf("bad body: %+v", body)
++		}
++		if attempts.Add(1) == 1 {
++			http.Error(w, "temporary outage", 503)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		w.Write([]byte(`{"status":"ok"}`))
++	}))
++	defer server.Close()
++	root := t.TempDir()
++	client := NewClient(server.URL)
++	client.transcriptOutbox = transcriptoutbox.New(root, server.URL)
++	if err := client.ReportTaskMessages(context.Background(), "task", []TaskMessageData{{Seq: 1, Type: "tool_use", CallID: "genuine-call-id", Tool: "shell"}}); err == nil {
++		t.Fatal("expected temporary error")
++	}
++	client = NewClient(server.URL)
++	client.transcriptOutbox = transcriptoutbox.New(root, server.URL)
++	if err := client.transcriptOutbox.Drain(context.Background(), client.transcriptSender); err != nil {
++		t.Fatal(err)
++	}
++	if pending, err := client.transcriptOutbox.Pending(); err != nil || len(pending) != 0 {
++		t.Fatalf("pending=%v err=%v", pending, err)
++	}
++	if attempts.Load() != 2 {
++		t.Fatalf("attempts=%d", attempts.Load())
++	}
++}
++
++func TestTranscriptEveryConstructedDaemonHasPersistentOutbox(t *testing.T) {
++	d := New(Config{ServerBaseURL: "http://localhost:18080", WorkspacesRoot: t.TempDir(), DaemonID: "personal"}, slog.New(slog.NewTextHandler(os.Stderr, nil)))
++	if d.client.transcriptOutbox == nil {
++		t.Fatal("production daemon must not use non-durable direct API path")
++	}
++}
++
++func TestTranscriptHealthExposesTaskOwnershipAndPendingTail(t *testing.T) {
++	d := New(Config{ServerBaseURL: "http://localhost:18080", WorkspacesRoot: t.TempDir(), DaemonID: "personal"}, slog.New(slog.NewTextHandler(os.Stderr, nil)))
++	d.activeTaskIDs = map[string]struct{}{"still-running": {}}
++	d.claimsInFlight = 1
++	if _, err := d.client.transcriptOutbox.Persist("finished-with-pending-tail", json.RawMessage(`[{"seq":1}]`)); err != nil {
++		t.Fatal(err)
++	}
++	request := httptest.NewRequest(http.MethodGet, "/health", nil)
++	response := httptest.NewRecorder()
++	d.healthHandler(time.Now()).ServeHTTP(response, request)
++	var health HealthResponse
++	if err := json.Unmarshal(response.Body.Bytes(), &health); err != nil {
++		t.Fatal(err)
++	}
++	if health.ClaimsInFlight != 1 || len(health.ActiveTaskIDs) != 1 || health.ActiveTaskIDs[0] != "still-running" {
++		t.Fatalf("ownership missing: %+v", health)
++	}
++	if health.TranscriptOutboxError || health.TranscriptPendingByTask["finished-with-pending-tail"] != 1 {
++		t.Fatalf("pending delivery hidden: %+v", health)
++	}
++}
+diff --git a/server/internal/daemon/transcriptoutbox/store.go b/server/internal/daemon/transcriptoutbox/store.go
+new file mode 100644
+index 0000000..a529d9d
+--- /dev/null
++++ b/server/internal/daemon/transcriptoutbox/store.go
+@@ -0,0 +1,187 @@
++// Package transcriptoutbox durably retries the official daemon transcript API.
++package transcriptoutbox
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"sync"
++)
++
++type Envelope struct {
++	TaskID   string          `json:"task_id"`
++	Messages json.RawMessage `json:"messages"`
++}
++
++// Store contains no credentials. Identity scopes a spool to one server/daemon.
++type Store struct {
++	dir string
++	mu  sync.Mutex
++}
++
++func New(root, identity string) *Store {
++	sum := sha256.Sum256([]byte(identity))
++	return &Store{dir: filepath.Join(root, ".transcript-outbox", hex.EncodeToString(sum[:16]))}
++}
++
++// Persist syncs before publishing a .json file; replay never reads partial data.
++func (s *Store) Persist(taskID string, messages json.RawMessage) (string, error) {
++	if taskID == "" || !json.Valid(messages) {
++		return "", errors.New("invalid transcript envelope")
++	}
++	data, err := json.Marshal(Envelope{TaskID: taskID, Messages: messages})
++	if err != nil {
++		return "", err
++	}
++	digest := sha256.Sum256(data)
++	name := hex.EncodeToString(digest[:]) + ".json"
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if err := os.MkdirAll(s.dir, 0700); err != nil {
++		return "", err
++	}
++	path := filepath.Join(s.dir, name)
++	if previous, err := os.ReadFile(path); err == nil {
++		if !bytes.Equal(previous, data) {
++			return "", errors.New("transcript digest conflict")
++		}
++		return path, nil
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return "", err
++	}
++	f, err := os.CreateTemp(s.dir, ".pending-")
++	if err != nil {
++		return "", err
++	}
++	tmp := f.Name()
++	defer os.Remove(tmp)
++	if err = f.Chmod(0600); err == nil {
++		_, err = f.Write(data)
++	}
++	if err == nil {
++		err = f.Sync()
++	}
++	closeErr := f.Close()
++	if err != nil {
++		return "", err
++	}
++	if closeErr != nil {
++		return "", closeErr
++	}
++	if err = os.Rename(tmp, path); err != nil {
++		return "", err
++	}
++	if err = syncDir(s.dir); err != nil {
++		return "", err
++	}
++	return path, nil
++}
++
++func syncDir(path string) error {
++	// Windows does not support directory fsync through os.File; the target
++	// deployment is Linux, where both data and directory entries are synced.
++	if runtime.GOOS == "windows" {
++		return nil
++	}
++	f, err := os.Open(path)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	return f.Sync()
++}
++
++type Sender func(context.Context, Envelope) error
++
++func (s *Store) Deliver(ctx context.Context, path string, send Sender) error {
++	if filepath.Dir(path) != s.dir || !strings.HasSuffix(path, ".json") {
++		return errors.New("invalid transcript path")
++	}
++	data, err := os.ReadFile(path)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	} // Another ACK already removed it.
++	if err != nil {
++		return err
++	}
++	var envelope Envelope
++	if err = json.Unmarshal(data, &envelope); err != nil {
++		return err
++	}
++	if envelope.TaskID == "" || !json.Valid(envelope.Messages) {
++		return errors.New("invalid pending transcript")
++	}
++	if err = send(ctx, envelope); err != nil {
++		return err
++	}
++	if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
++		return err
++	}
++	return syncDir(s.dir)
++}
++
++// Drain retries independent tasks even if one task returns a permanent error.
++// Files are never silently discarded because an HTTP status is non-retryable.
++func (s *Store) Drain(ctx context.Context, send Sender) error {
++	entries, err := os.ReadDir(s.dir)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	var failures []error
++	for _, entry := range entries {
++		if err := ctx.Err(); err != nil {
++			return errors.Join(append(failures, err)...)
++		}
++		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
++			continue
++		}
++		if err := s.Deliver(ctx, filepath.Join(s.dir, entry.Name()), send); err != nil {
++			failures = append(failures, fmt.Errorf("pending transcript: %w", err))
++		}
++	}
++	return errors.Join(failures...)
++}
++
++// Pending reports durable batches by task, including completed/cancelled tasks.
++func (s *Store) Pending() (map[string]int, error) {
++	result := map[string]int{}
++	entries, err := os.ReadDir(s.dir)
++	if errors.Is(err, os.ErrNotExist) {
++		return result, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	for _, entry := range entries {
++		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
++			continue
++		}
++		data, err := os.ReadFile(filepath.Join(s.dir, entry.Name()))
++		if errors.Is(err, os.ErrNotExist) {
++			continue
++		}
++		if err != nil {
++			return nil, err
++		}
++		var envelope Envelope
++		if err = json.Unmarshal(data, &envelope); err != nil {
++			return nil, err
++		}
++		if envelope.TaskID == "" || !json.Valid(envelope.Messages) {
++			return nil, errors.New("invalid pending transcript")
++		}
++		result[envelope.TaskID]++
++	}
++	return result, nil
++}
+diff --git a/server/internal/daemon/transcriptoutbox/store_test.go b/server/internal/daemon/transcriptoutbox/store_test.go
+new file mode 100644
+index 0000000..c50bc5d
+--- /dev/null
++++ b/server/internal/daemon/transcriptoutbox/store_test.go
+@@ -0,0 +1,125 @@
++package transcriptoutbox
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++)
++
++func TestReplayAfterCommittedResponseLostAndRestart(t *testing.T) {
++	root := t.TempDir()
++	store := New(root, "server\ndaemon")
++	path, err := store.Persist("task", json.RawMessage(`[{"seq":1,"type":"tool_use","call_id":"cli-real-call-id"}]`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	committed := map[string]bool{}
++	attempts := 0
++	send := func(_ context.Context, envelope Envelope) error {
++		attempts++
++		committed[envelope.TaskID+string(envelope.Messages)] = true
++		if attempts == 1 {
++			return errors.New("response lost after server commit")
++		}
++		return nil
++	}
++	if err := store.Deliver(context.Background(), path, send); err == nil {
++		t.Fatal("expected uncertain acknowledgement")
++	}
++	store = New(root, "server\ndaemon")
++	if pending, err := store.Pending(); err != nil || pending["task"] != 1 {
++		t.Fatalf("pending=%v err=%v", pending, err)
++	}
++	if err := store.Drain(context.Background(), send); err != nil {
++		t.Fatal(err)
++	}
++	if attempts != 2 || len(committed) != 1 {
++		t.Fatalf("attempts=%d committed=%d", attempts, len(committed))
++	}
++	if pending, err := store.Pending(); err != nil || len(pending) != 0 {
++		t.Fatalf("pending=%v err=%v", pending, err)
++	}
++}
++
++func TestConcurrentTasksPersistIndependently(t *testing.T) {
++	store := New(t.TempDir(), "server\ndaemon")
++	var wg sync.WaitGroup
++	for _, taskID := range []string{"codex-a", "codex-b"} {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			if _, err := store.Persist(taskID, json.RawMessage(`[{"seq":1,"type":"text","content":"working"}]`)); err != nil {
++				t.Error(err)
++			}
++		}()
++	}
++	wg.Wait()
++	err := store.Drain(context.Background(), func(_ context.Context, envelope Envelope) error {
++		if envelope.TaskID == "codex-a" {
++			return errors.New("temporarily offline")
++		}
++		return nil
++	})
++	if err == nil {
++		t.Fatal("expected retained failure")
++	}
++	pending, err := store.Pending()
++	if err != nil || pending["codex-a"] != 1 || pending["codex-b"] != 0 {
++		t.Fatalf("pending=%v err=%v", pending, err)
++	}
++}
++
++func TestRepeatedPersistAndPrivateFilePermissions(t *testing.T) {
++	store := New(t.TempDir(), "server\ndaemon")
++	payload := json.RawMessage(`[{"seq":2,"type":"tool_result","output_truncated":true}]`)
++	one, err := store.Persist("task", payload)
++	if err != nil {
++		t.Fatal(err)
++	}
++	two, err := store.Persist("task", payload)
++	if err != nil || one != two {
++		t.Fatalf("one=%s two=%s err=%v", one, two, err)
++	}
++	info, err := os.Stat(one)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm()&0077 != 0 && os.PathSeparator != '\\' {
++		t.Fatal("transcript exposed to other users")
++	}
++	if _, err := New(filepath.Dir(filepath.Dir(store.dir)), "another-server").Pending(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestWriteFailureAndCorruptEnvelopeAreVisible(t *testing.T) {
++	root := t.TempDir()
++	block := filepath.Join(root, "file-not-directory")
++	if err := os.WriteFile(block, []byte("blocked"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := New(block, "server").Persist("task", json.RawMessage(`[]`)); err == nil {
++		t.Fatal("write failure must propagate")
++	}
++	store := New(root, "server")
++	path, err := store.Persist("task", json.RawMessage(`[]`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, []byte("corrupt"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := store.Pending(); err == nil {
++		t.Fatal("corrupt pending record must remain visible")
++	}
++	if err := store.Drain(context.Background(), func(context.Context, Envelope) error { t.Fatal("must not send corrupt data"); return nil }); err == nil {
++		t.Fatal("expected corruption error")
++	}
++	if _, err := os.Stat(path); err != nil {
++		t.Fatal("failed records must not be deleted")
++	}
++}
+diff --git a/server/internal/handler/daemon.go b/server/internal/handler/daemon.go
+index d2ec251..bdc099d 100644
+--- a/server/internal/handler/daemon.go
++++ b/server/internal/handler/daemon.go
+@@ -4721,6 +4721,7 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
+ // ---------------------------------------------------------------------------
+ 
+ type TaskMessageRequest struct {
++	CallID  string         `json:"call_id,omitempty"`
+ 	Seq     int            `json:"seq"`
+ 	Type    string         `json:"type"`
+ 	Tool    string         `json:"tool,omitempty"`
+@@ -4798,9 +4799,14 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
+ 		// Tri-state through a text[]: "" is NULL, matching how the query maps
+ 		// every other nullable column in this batch.
+ 		OutputTruncations: make([]string, 0, n),
++		CallIds:           make([]string, 0, n),
+ 	}
+ 	createdAts := taskMessageCreatedAts(req.Messages, time.Now().UTC())
+ 	for i, msg := range req.Messages {
++		if msg.Seq < 1 || int64(msg.Seq) > 2147483647 {
++			writeError(w, http.StatusBadRequest, "invalid transcript sequence")
++			return
++		}
+ 		id, err := uuid.NewV7()
+ 		if err != nil {
+ 			slog.Error("failed to generate task message id", "task_id", taskID, "error", err)
+@@ -4856,6 +4862,7 @@ func (h *Handler) ReportTaskMessages(w http.ResponseWriter, r *http.Request) {
+ 		params.Outputs = append(params.Outputs, msg.Output)
+ 		params.CreatedAts = append(params.CreatedAts, createdAts[i])
+ 		params.OutputTruncations = append(params.OutputTruncations, boolArrayElement(msg.OutputTruncated))
++		params.CallIds = append(params.CallIds, util.SanitizeTextForPostgres(msg.CallID))
+ 	}
+ 
+ 	created, err := h.Queries.CreateTaskMessages(r.Context(), params)
+@@ -4995,6 +5002,7 @@ func taskMessageToPayload(m db.TaskMessage, taskID, issueID string) protocol.Tas
+ 		createdAt = m.CreatedAt.Time.UTC().Format(time.RFC3339Nano)
+ 	}
+ 	return protocol.TaskMessagePayload{
++		CallID:          m.CallID.String,
+ 		TaskID:          taskID,
+ 		IssueID:         issueID,
+ 		Seq:             int(m.Seq),
+diff --git a/server/internal/handler/task_message_idempotency_test.go b/server/internal/handler/task_message_idempotency_test.go
+new file mode 100644
+index 0000000..c4a3c83
+--- /dev/null
++++ b/server/internal/handler/task_message_idempotency_test.go
+@@ -0,0 +1,41 @@
++package handler
++
++import (
++	"context"
++	"net/http"
++	"testing"
++
++	"github.com/multica-ai/multica/server/internal/testutil"
++	"github.com/multica-ai/multica/server/internal/util"
++)
++
++func TestReportTaskMessagesRetryIsIdempotentAndPreservesCallID(t *testing.T) {
++	if testHandler == nil {
++		t.Skip("database not available; requires migrations 478 and 479")
++	}
++	taskID := seedBatchTask(t, "transcript-idempotency")
++	messages := []any{
++		map[string]any{"seq": 1, "type": "tool_use", "tool": "shell", "call_id": "real-a", "input": map[string]any{"command": "pwd"}},
++		map[string]any{"seq": 2, "type": "tool_use", "tool": "shell", "call_id": "real-b", "input": map[string]any{"command": "ls"}},
++		map[string]any{"seq": 3, "type": "tool_result", "tool": "shell", "call_id": "real-b", "output": "files"},
++		map[string]any{"seq": 4, "type": "tool_result", "tool": "shell", "call_id": "real-a", "output": "/workspace"},
++	}
++	for range 2 {
++		testutil.Call(t, testHandler.ReportTaskMessages, batchMessagesRequest(t, taskID, messages)).Want(http.StatusOK)
++	}
++	stored, err := testHandler.Queries.ListTaskMessages(context.Background(), util.MustParseUUID(taskID))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(stored) != 4 {
++		t.Fatalf("retry stored %d rows, expected four unique sequences", len(stored))
++	}
++	for index, want := range []string{"real-a", "real-b", "real-b", "real-a"} {
++		if stored[index].CallID.String != want {
++			t.Fatalf("row %d lost call ID: %+v", index, stored[index])
++		}
++		if got := taskMessageToPayload(stored[index], taskID, "").CallID; got != want {
++			t.Fatalf("public payload call ID=%q want=%q", got, want)
++		}
++	}
++}
+diff --git a/server/internal/service/builtin_skills/multica-platform/references/runtimes.md b/server/internal/service/builtin_skills/multica-platform/references/runtimes.md
+index aeaa059..9cadd31 100644
+--- a/server/internal/service/builtin_skills/multica-platform/references/runtimes.md
++++ b/server/internal/service/builtin_skills/multica-platform/references/runtimes.md
+@@ -164,3 +164,12 @@ Workspace repos and project resources are not the same thing:
+ Do not add a project resource just because `repo checkout` failed. First
+ determine whether the user asked for durable project context or just a task
+ checkout.
++# DSH integration patch: transcript delivery
++
++The pinned DSH deployment adds durable daemon transcript delivery. Failed message
++batches remain under `.transcript-outbox` in the configured workspace root and
++are retried after restart. Do not remove this directory during task cleanup.
++The local daemon health response exposes `transcript_pending_by_task` and
++`transcript_outbox_error`; execution completion alone does not prove transcript
++delivery completed. Public task messages preserve optional provider `call_id`.
++Messages without this field must not be paired by guessed invocation IDs.
+diff --git a/server/migrations/478_task_message_call_id.down.sql b/server/migrations/478_task_message_call_id.down.sql
+new file mode 100644
+index 0000000..a332be5
+--- /dev/null
++++ b/server/migrations/478_task_message_call_id.down.sql
+@@ -0,0 +1 @@
++ALTER TABLE task_message DROP COLUMN IF EXISTS call_id;
+diff --git a/server/migrations/478_task_message_call_id.up.sql b/server/migrations/478_task_message_call_id.up.sql
+new file mode 100644
+index 0000000..0026953
+--- /dev/null
++++ b/server/migrations/478_task_message_call_id.up.sql
+@@ -0,0 +1 @@
++ALTER TABLE task_message ADD COLUMN IF NOT EXISTS call_id TEXT;
+diff --git a/server/migrations/479_task_message_sequence_unique.down.sql b/server/migrations/479_task_message_sequence_unique.down.sql
+new file mode 100644
+index 0000000..34a3dff
+--- /dev/null
++++ b/server/migrations/479_task_message_sequence_unique.down.sql
+@@ -0,0 +1 @@
++DROP INDEX CONCURRENTLY IF EXISTS task_message_task_seq_unique;
+diff --git a/server/migrations/479_task_message_sequence_unique.up.sql b/server/migrations/479_task_message_sequence_unique.up.sql
+new file mode 100644
+index 0000000..4b1a47d
+--- /dev/null
++++ b/server/migrations/479_task_message_sequence_unique.up.sql
+@@ -0,0 +1 @@
++CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS task_message_task_seq_unique ON task_message (task_id, seq);
+diff --git a/server/pkg/db/generated/models.go b/server/pkg/db/generated/models.go
+index 323fb57..e3ad619 100644
+--- a/server/pkg/db/generated/models.go
++++ b/server/pkg/db/generated/models.go
+@@ -1328,6 +1328,7 @@ type TaskMessage struct {
+ 	Output          pgtype.Text        `json:"output"`
+ 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+ 	OutputTruncated pgtype.Bool        `json:"output_truncated"`
++	CallID          pgtype.Text        `json:"call_id"`
+ }
+ 
+ type TaskToken struct {
+diff --git a/server/pkg/db/generated/task_message.sql.go b/server/pkg/db/generated/task_message.sql.go
+index 03e6c4d..8fa5ec0 100644
+--- a/server/pkg/db/generated/task_message.sql.go
++++ b/server/pkg/db/generated/task_message.sql.go
+@@ -14,7 +14,7 @@ import (
+ const createTaskMessage = `-- name: CreateTaskMessage :one
+ INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output, output_truncated)
+ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+-RETURNING id, task_id, seq, type, tool, content, input, output, created_at, output_truncated
++RETURNING id, task_id, seq, type, tool, content, input, output, created_at, output_truncated, call_id
+ `
+ 
+ type CreateTaskMessageParams struct {
+@@ -53,6 +53,7 @@ func (q *Queries) CreateTaskMessage(ctx context.Context, arg CreateTaskMessagePa
+ 		&i.Output,
+ 		&i.CreatedAt,
+ 		&i.OutputTruncated,
++		&i.CallID,
+ 	)
+ 	return i, err
+ }
+@@ -73,12 +74,13 @@ WITH incoming AS (
+         unnest($6::text[]) AS input,
+         unnest($7::text[]) AS output,
+         unnest($8::text[]) AS created_at,
+-        unnest($9::text[]) AS output_truncated
++        unnest($9::text[]) AS output_truncated,
++        unnest($10::text[]) AS call_id
+ ), inserted AS (
+-    INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output, created_at, output_truncated)
++    INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output, created_at, output_truncated, call_id)
+     SELECT
+         m.id,
+-        $10::uuid,
++        $11::uuid,
+         m.seq,
+         m.type,
+         NULLIF(m.tool, ''),
+@@ -86,11 +88,13 @@ WITH incoming AS (
+         NULLIF(m.input, '')::jsonb,
+         NULLIF(m.output, ''),
+         COALESCE(NULLIF(m.created_at, '')::timestamptz, now()),
+-        NULLIF(m.output_truncated, '')::bool
++        NULLIF(m.output_truncated, '')::bool,
++        NULLIF(m.call_id, '')
+     FROM incoming AS m
+-    RETURNING id, task_id, seq, type, tool, content, input, output, created_at, output_truncated
++    ON CONFLICT (task_id, seq) DO NOTHING
++    RETURNING id, task_id, seq, type, tool, content, input, output, created_at, output_truncated, call_id
+ )
+-SELECT id, task_id, seq, type, tool, content, input, output, created_at, output_truncated FROM inserted ORDER BY seq ASC
++SELECT id, task_id, seq, type, tool, content, input, output, created_at, output_truncated, call_id FROM inserted ORDER BY seq ASC
+ `
+ 
+ type CreateTaskMessagesParams struct {
+@@ -103,6 +107,7 @@ type CreateTaskMessagesParams struct {
+ 	Outputs           []string      `json:"outputs"`
+ 	CreatedAts        []string      `json:"created_ats"`
+ 	OutputTruncations []string      `json:"output_truncations"`
++	CallIds           []string      `json:"call_ids"`
+ 	TaskID            pgtype.UUID   `json:"task_id"`
+ }
+ 
+@@ -117,6 +122,7 @@ type CreateTaskMessagesRow struct {
+ 	Output          pgtype.Text        `json:"output"`
+ 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+ 	OutputTruncated pgtype.Bool        `json:"output_truncated"`
++	CallID          pgtype.Text        `json:"call_id"`
+ }
+ 
+ // Batch variant of CreateTaskMessage: persists a whole daemon-reported batch in
+@@ -151,10 +157,9 @@ type CreateTaskMessagesRow struct {
+ //
+ // Atomicity is a deliberate side effect, not just a speedup: the per-message
+ // loop this replaces could persist part of a batch and then fail, leaving the
+-// transcript with a prefix of the batch and no way to complete it — the daemon
+-// does not retry this endpoint. One statement makes the batch all-or-nothing,
+-// which buys consistency; a batch that fails is still lost whole, so closing
+-// the gap for real needs a retry plus a (task_id, seq) uniqueness rule.
++// transcript with a prefix of the batch. The daemon durably retries failed
++// batches; the unique task/sequence index and ON CONFLICT below make retries
++// idempotent, including a committed write whose HTTP acknowledgement was lost.
+ //
+ // The ORDER BY is a contract, not decoration. A bare `INSERT ... RETURNING`
+ // has no defined row order, and the caller republishes these rows as realtime
+@@ -173,6 +178,7 @@ func (q *Queries) CreateTaskMessages(ctx context.Context, arg CreateTaskMessages
+ 		arg.Outputs,
+ 		arg.CreatedAts,
+ 		arg.OutputTruncations,
++		arg.CallIds,
+ 		arg.TaskID,
+ 	)
+ 	if err != nil {
+@@ -193,6 +199,7 @@ func (q *Queries) CreateTaskMessages(ctx context.Context, arg CreateTaskMessages
+ 			&i.Output,
+ 			&i.CreatedAt,
+ 			&i.OutputTruncated,
++			&i.CallID,
+ 		); err != nil {
+ 			return nil, err
+ 		}
+@@ -215,7 +222,7 @@ func (q *Queries) DeleteTaskMessages(ctx context.Context, taskID pgtype.UUID) er
+ }
+ 
+ const listTaskMessages = `-- name: ListTaskMessages :many
+-SELECT id, task_id, seq, type, tool, content, input, output, created_at, output_truncated FROM task_message
++SELECT id, task_id, seq, type, tool, content, input, output, created_at, output_truncated, call_id FROM task_message
+ WHERE task_id = $1
+ ORDER BY seq ASC
+ `
+@@ -240,6 +247,7 @@ func (q *Queries) ListTaskMessages(ctx context.Context, taskID pgtype.UUID) ([]T
+ 			&i.Output,
+ 			&i.CreatedAt,
+ 			&i.OutputTruncated,
++			&i.CallID,
+ 		); err != nil {
+ 			return nil, err
+ 		}
+@@ -252,7 +260,7 @@ func (q *Queries) ListTaskMessages(ctx context.Context, taskID pgtype.UUID) ([]T
+ }
+ 
+ const listTaskMessagesSince = `-- name: ListTaskMessagesSince :many
+-SELECT id, task_id, seq, type, tool, content, input, output, created_at, output_truncated FROM task_message
++SELECT id, task_id, seq, type, tool, content, input, output, created_at, output_truncated, call_id FROM task_message
+ WHERE task_id = $1 AND seq > $2
+ ORDER BY seq ASC
+ `
+@@ -282,6 +290,7 @@ func (q *Queries) ListTaskMessagesSince(ctx context.Context, arg ListTaskMessage
+ 			&i.Output,
+ 			&i.CreatedAt,
+ 			&i.OutputTruncated,
++			&i.CallID,
+ 		); err != nil {
+ 			return nil, err
+ 		}
+diff --git a/server/pkg/db/queries/task_message.sql b/server/pkg/db/queries/task_message.sql
+index 18ba704..23db731 100644
+--- a/server/pkg/db/queries/task_message.sql
++++ b/server/pkg/db/queries/task_message.sql
+@@ -36,10 +36,9 @@ RETURNING *;
+ --
+ -- Atomicity is a deliberate side effect, not just a speedup: the per-message
+ -- loop this replaces could persist part of a batch and then fail, leaving the
+--- transcript with a prefix of the batch and no way to complete it — the daemon
+--- does not retry this endpoint. One statement makes the batch all-or-nothing,
+--- which buys consistency; a batch that fails is still lost whole, so closing
+--- the gap for real needs a retry plus a (task_id, seq) uniqueness rule.
++-- transcript with a prefix of the batch. The daemon durably retries failed
++-- batches; the unique task/sequence index and ON CONFLICT below make retries
++-- idempotent, including a committed write whose HTTP acknowledgement was lost.
+ --
+ -- The ORDER BY is a contract, not decoration. A bare `INSERT ... RETURNING`
+ -- has no defined row order, and the caller republishes these rows as realtime
+@@ -62,9 +61,10 @@ WITH incoming AS (
+         unnest(sqlc.arg('inputs')::text[]) AS input,
+         unnest(sqlc.arg('outputs')::text[]) AS output,
+         unnest(sqlc.arg('created_ats')::text[]) AS created_at,
+-        unnest(sqlc.arg('output_truncations')::text[]) AS output_truncated
++        unnest(sqlc.arg('output_truncations')::text[]) AS output_truncated,
++        unnest(sqlc.arg('call_ids')::text[]) AS call_id
+ ), inserted AS (
+-    INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output, created_at, output_truncated)
++    INSERT INTO task_message (id, task_id, seq, type, tool, content, input, output, created_at, output_truncated, call_id)
+     SELECT
+         m.id,
+         sqlc.arg('task_id')::uuid,
+@@ -75,8 +75,10 @@ WITH incoming AS (
+         NULLIF(m.input, '')::jsonb,
+         NULLIF(m.output, ''),
+         COALESCE(NULLIF(m.created_at, '')::timestamptz, now()),
+-        NULLIF(m.output_truncated, '')::bool
++        NULLIF(m.output_truncated, '')::bool,
++        NULLIF(m.call_id, '')
+     FROM incoming AS m
++    ON CONFLICT (task_id, seq) DO NOTHING
+     RETURNING *
+ )
+ SELECT * FROM inserted ORDER BY seq ASC;
+diff --git a/server/pkg/protocol/messages.go b/server/pkg/protocol/messages.go
+index 95ea0a3..efc961f 100644
+--- a/server/pkg/protocol/messages.go
++++ b/server/pkg/protocol/messages.go
+@@ -199,6 +199,7 @@ type ChatQuickActionsPayload struct {
+ 
+ // TaskMessagePayload represents a single agent execution message (tool call, text, etc.)
+ type TaskMessagePayload struct {
++	CallID  string         `json:"call_id,omitempty"`
+ 	TaskID  string         `json:"task_id"`
+ 	IssueID string         `json:"issue_id,omitempty"`
+ 	Seq     int            `json:"seq"`
